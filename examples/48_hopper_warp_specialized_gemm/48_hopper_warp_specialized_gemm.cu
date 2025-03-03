@@ -29,6 +29,17 @@
  *
  **************************************************************************************************/
 
+// <NT> Hopper架构的 warp specialized gemm
+// hopper架构引入了一系列新型张量核心指令GMMA，相较于安培架构的张量核心指令，这些指令的效率更高。（wgmma是异步指令，mma是同步指令）
+//           配备了全新的张量内存加速器（TMA）单元，能够在全局内存和共享内存之间高效地传输大量数据块。
+//           TMA 还支持集群内线程块之间的异步数据复制。此外，TMA 可以加载 FP32 数据并将其隐式转换为 TF32。
+//
+// Warp Specialization定义:https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#spatial-partitioning-also-known-as-warp-specialization
+//   线程块可以进行空间划分，使得各个线程束专门用于执行独立的计算任务。空间划分采用生产者-消费者模式，
+//   其中一部分线程负责生成数据，而另一部分（不相交的）线程则同时对这些数据进行消费。
+//   生产者 / 消费者空间划分模式需要进行两次单边同步操作，以管理生产者和消费者之间的数据缓冲区。
+//   与手工实现的multi-stages的初衷一样，用于掩盖访存和计算时延，Warp Specialization针对warp级别，Multi-stages针对阶段级别，二者可相辅相成。
+//   
 /*! \file
     \brief Simple Hopper GEMM example using CUTLASS 3.0 APIs for NVIDIA Hopper architecture
 

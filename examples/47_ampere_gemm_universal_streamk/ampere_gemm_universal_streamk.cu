@@ -29,6 +29,33 @@
  *
  **************************************************************************************************/
 
+// <NT> Stream-k，主要是为了优化wave quantization问题而设计
+// https://zhuanlan.zhihu.com/p/716352563
+// https://zhuanlan.zhihu.com/p/7259261717
+// 
+// wave quantization定义：每个CTA(thread block)会被分配到特定的SM硬件单元中，所有的SM可以并行执行的CTA称为一个wave。
+//
+/// 如有a矩阵：0  1  2  3  4  5
+//            6  7  8  9 10 11
+//           12 13 14 15 16 17
+//           18 19 20 21 22 23
+//           24 25 26 27 28 29
+// 1.在DP-gemm方案中，沿着无依赖关系的MN维度进行划分
+//   如有4个sm，每个sm一时刻负责一个block线程，一个block负责一行6个tile数据。
+//   则有wave0(sm0(第0行)，sm1(第1行), sm2(第二行), sm3(第三行))，wave1时只处理最后一行，wave1未占满sm，wave1浪费4/3资源；
+// 2. 在DP-gemm的基础上加上split-k，即a矩阵列方向切分，假设对半切，
+//    则wave0=(sm0(0,1,2), sm1(3,4,5), sm2(6,7,8), sm3(9,10,11)), wave2(sm0(25,26,27), sm1(27,28,29)),wave2浪费1/2资源。
+//    另外k方向的切分是需要汇总的，即同一行负责不同列的两个sm需要做同步归约。如012和345由两个sm负责，二者结果需要规约，
+// 3. Stream-K算法，将直接将 MNK 三个维度融合了之后统一考虑并行切分，如wave0(sm0(0-7), sm1(8-15), sm2(16-23), sm3(24-29)),
+//    其中sm3是负责6个tile，即浪费了2/8资源，是三个方案中浪费最少的。
+// 注意split-k和stream-k都需要做跨sm的数据同步（block间同步）。
+//
+// 扩展笔记：线程块内同步__syncthreads();          设备同步：cudaDeviceSynchronize();
+//          事件同步：cudaEventSynchronize();     流同步：cudaStreamSynchronize();
+//          block之间没有提供同步机制，一般的同步方式是：原子操作与全局内存标记，各自结果叠加到目的地；分多个kernel，在外部规约；
+//
+// 下面例子也展示了dp-gemm，split-k，stream-k的对比试验。
+
 /***************************************************************************************************
  Example contrasting the Stream-K parallel decomposition for GEMM threadblocks versus the
  "classic data-parallel" and "Split-K" decompositions.

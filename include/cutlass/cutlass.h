@@ -38,6 +38,15 @@
 #include "cutlass/arch/synclog.hpp"
 #include "cutlass/detail/helper_macros.hpp"
 
+// <NT> 显卡架构演进和重大更新
+// sm70 volta: 首次提出tensor core，开始支持mma，仅支持fp16。
+// sm75 turing: 一个warp的mma处理数据量增多，扩展int8和int4计算
+// sm80 ampere：一个warp的mma处理数据量进一步增多, 新增cp.async异步拷贝指令（用于multi-stage，之前的只能是同步的2-stage，即double-buffer）
+// sm89 ada lovelace: mma开始支持fp8. (L40)
+// sm90 hopper: mma开始支持fp64，提出tma张量拷贝指令，warp-specialize的概念和wgmma(wg=warp_group，定义为连续4个warp，在hopper中首次被提出)
+//              wgmma.mma_async 是异步操作，对比之前的同步指令mma.sync, 颗粒度更大。
+// sm100 blackwell, 
+// => vtahb
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -91,7 +100,8 @@ static char const* cutlassGetStatusString(cutlass::Status status) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// <NT> warp是32个线程，太老的显卡不做考虑。1 warpgroup = 4 warp = 128 thread。
+//      quad是4线程组，一种线程组织的单元 （20250227-代码中未被使用到）
 static const int NumThreadsPerWarp = 32;
 static const int NumThreadsPerWarpGroup = 128;
 static const int NumWarpsPerWarpGroup = NumThreadsPerWarpGroup / NumThreadsPerWarp;
@@ -110,6 +120,7 @@ CUTLASS_HOST_DEVICE bool thread0() {
   #endif
 }
 
+// <NT> warp内线程id号(0-31)
 /// Returns a lane index in the warp. The threads in warp may not be convergent
 CUTLASS_DEVICE
 int canonical_lane_idx() { 
@@ -120,6 +131,9 @@ int canonical_lane_idx() {
   #endif
 }
 
+// <NT> __shfl_sync 用于在warp内进行数据交换，原型：typename T __shfl_sync(unsigned mask, T var, int srcLane, int width = warpSize);
+// mask: 32位无符号整数，指定哪些线程会参与当前的数据交换操作，0xffffffff 意味着线程束内的所有 32 个线程都会参与此次操作。
+// var：要进行交换的数据. srcLane: 对应warp里线程号（0-31），填0，表示由warp里0号线程获取数据结果，并广播给其他参与此次操作的线程。
 /// Returns a warp-uniform value indicating the canonical warp index of the calling threads.
 /// Threads within the warp must be converged.
 CUTLASS_DEVICE
@@ -131,6 +145,7 @@ int canonical_warp_idx_sync() {
   #endif
 }
 
+// <NT> block内warp id号, threadIdx.x的范围是(0 - block内线程数), cutlass的线程组织大多以一维布局，下面写法只针对一维。
 /// Returns a warp index in the CTA. The threads in warp may not be convergent
 /// As it doesn't sync the warp, it faster and allows forward progress
 CUTLASS_DEVICE

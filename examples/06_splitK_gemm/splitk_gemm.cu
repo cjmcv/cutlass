@@ -30,6 +30,46 @@
  **************************************************************************************************/
 
 /**
+<NT> split-k 注解翻译
+什么是split-k：考虑一个问题规模为 M = 128、N = 128、K = 4096 的情况。在这种情况下，如果thread-block tile是 128x128x4096，那么我们将启动一个thread block，
+它会占用 V100 上 84 个流式多处理器（SM）中的一个。因此，计算效率非常低。那么，可以通过split-k来处理。它是一种对矩阵乘法的 K 维度进行划分，并将其分布到多个 SM 上的方法，
+从而比使用单个 SM 获得更高的效率。在上述示例中，我们可以使用分块 K 因子 16 对 K 维度进行划分，即block tile大小将变为 128x128x256，并且会在 16 个 SM 上启动。
+一旦每个block计算出它们的部分内积（输出的 1/16），它们会将结果累加到单个输出矩阵中。
+
+CUTLASS 将一个kernel划分为层次化的可组合部分。thread tile => warp tile => block tile。分别对应一个线程，一个warp和一个block负责计算的tile大小。
+
+=====================================================
+
+在这个示例中，我们将变量初始化分为以下两部分：
+设置数据属性：描述矩阵在内存中的布局方式，以及内核如何看待它们（逻辑到物理的映射）。
+设置计算属性：描述上述设置的矩阵将如何用于计算矩阵乘法的输出。
+
+首先，我们设置矩阵 A、B、C 和 D 的数据类型，以及 α 和 β，因为 GEMM 的方程是 D = α * A * B + β * C。
+在 CUTLASS 中，内核首先计算 A * B，然后将其余的计算留到内核末尾，因为 α * X + β * C 是对 X（A * B）和 C 进行的简单逐元素操作。
+我们将此称为内核的尾声（epilogue）。因此，我们将 α 和 β 的数据类型设置为与 ElementComputeEpilogue = float 相等。
+由于我们希望在 Volta 上使用矩阵乘法累加（MMA）指令，而这些指令仅支持半精度浮点数（fp16 或 half），
+所以我们将输入矩阵 A 和 B 中的元素的数据类型设置为 cutlass::half_t。Volta 还支持将部分点积累加到 fp32，fp32 可以存储更大范围的数字，
+我们将其用作输出矩阵元素和累加的数据类型。我们通过初始化模板变量 ElementAccumulator（float）、ElementComputeEpilogue（float）、
+ElementInputA（cutlass::half_t）、ElementInputB（cutlass::half_t）、ElementOutput（float）将这些信息传达给 CUTLASS 内核。
+仅仅传达数据类型是不够的。由于数据在内存中是线性布局的，我们还必须传达矩阵的布局。
+
+我们通过将模板变量 LayoutInputA 初始化为列主序的 CUTLASS 变量、LayoutInputB 初始化为行主序以及 LayoutOutput 初始化为行主序来实现这一点。
+接下来，我们设置计算 α * X + β * C 的规则，这被称为内核的尾声。我们初始化模板变量 EpilogueOp，它接受输出的数据类型 ElementOutput（float）、
+每个向量内存访问的元素数量（16）、累加器的数据类型（float）以及线性组合（α * X + β * C）的计算数据类型。
+
+现在我们已经设置了数据的属性，接下来必须设置计算的属性。
+其次，我们分别将线程块、线程束和 MMA 操作的瓦片大小的模板变量设置为 128x128x32、64x64x4、8x8x4（M x N x K）。
+当将这些变量传递给实例化 CUTLASS GEMM 内核时，它会在内部推导出每个线程块所需的线程数量、共享内存的大小、以无存储体冲突的方式存储数据，
+以及组合、初始化和启动高性能 GEMM 内核所需的大量其他变量。这就是 CUTLASS 的美妙之处，它让开发人员无需理解和编写复杂的硬件优化代码，因为这些代码很容易出错。
+还有一些其他的模板变量也会被初始化，例如，在某个 SM 上启动的线程块将处理输出矩阵的哪个线程块瓦片，以及你希望运行程序的 GPU 的 CUDA SM 架构。
+所有这些设置组合在一起，使用 cutlass::gemm::device::GemmSplitKParallel 模板创建一个描述 CUTLASS GEMM 内核的模板变量。
+下一步是初始化物理数据、实例化并初始化 CUTLASS 内核，然后运行它。我们使用 CUTLASS 实用工具来初始化、填充和比较矩阵，因为这些工具简单易用，不会影响我们学习 CUTLASS。
+一旦所有矩阵都被初始化并填充了数据，就创建一个参数元组来启动 CUTLASS 内核，该元组包含问题规模（M = 5120、N = 4096 和 K = 4096）、
+矩阵、α、β 以及重要的分块 K 维度因子。此外，我们还会查询 CUTLASS，了解我们实例化的内核是否需要任何临时存储空间。如果需要，我们会创建它，
+并将其与其他创建的参数一起传递给初始化 CUTLASS 内核，然后启动内核。
+在这个示例中，我们随后会启动一个参考 GEMM 内核（来自 CUTLASS 实用工具），以比较 CUTLASS 内核的输出是否与参考 GEMM 内核的输出相同。
+
+
 This example shows how to use split-k version of matrix multiplication using functions and data
 structures provided by CUTLASS; which we run on a NVIDIA Volta GPU.
 

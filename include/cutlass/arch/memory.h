@@ -38,6 +38,25 @@
 #include "cutlass/arch/cache_operation.h"
 #include "cutlass/platform/platform.h"
 
+// <NT> ldmatrix.sync / cp.async
+// // sm75 turing
+// ldmatrix.sync.aligned.x1.m8n8.shared.b16
+// ldmatrix.sync.aligned.x2.m8n8.shared.b16
+// ldmatrix.sync.aligned.x4.m8n8.shared.b16        * 看sm75的详细注解, ldmatrix与mma搭配使用
+// ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16
+// ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16
+// ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16
+//
+// // sm80 ampere 新增异步拷贝指令
+// cp.async.ca.shared.global.L2::128B              * 看memory_sm80.h开头笔记
+// cp.async.ca.shared.global
+// cp.async.cg.shared.global.L2::128B
+// cp.async.cg.shared.global
+//
+// // sm90 hopper 新增tma tensor拷贝指令
+// cp.async.bulk.tensor...                         * 在cute/arch/copy_sm90_tma.hpp
+
+
 namespace cutlass {
 namespace arch {
 
