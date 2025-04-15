@@ -69,6 +69,16 @@ ElementInputA（cutlass::half_t）、ElementInputB（cutlass::half_t）、ElementOutpu
 并将其与其他创建的参数一起传递给初始化 CUTLASS 内核，然后启动内核。
 在这个示例中，我们随后会启动一个参考 GEMM 内核（来自 CUTLASS 实用工具），以比较 CUTLASS 内核的输出是否与参考 GEMM 内核的输出相同。
 
+<NT> threadblock tile / warp tile / mma tile 的选择
+下面例子分别设为(128,128,32), (64,64,32), (8,8,4). 
+1）三者需要能依次被整除；
+2）每个SM都有4个warp调度器，应每个调度器有多于1个warp可以让它有更多的调度空间，也不能设置太多，会减少每个warp可用的寄存器数量。
+   所以一般一个block里设定256(256/32=8个warp)，有时也因整除需要或寄存器不足的需求，会设为128个线程即4个warp。
+   如当前splitk里面，threadblock_tile里可分成4个warp_tile。
+   又如hopper架构后(sm90)，一个warp group为4个warp。
+3）block_tile的大小需要根据problem_shape和sm数量来考量，一个block由一个sm调度。如block_tile太大则sm用不完(寄存器也需要考虑)，sm太小则切换频繁。
+4）mma_tile可以查询 笔记 "mma.sync 随架构演进"，架构可支持下，一般越大越好，除非problem shape有限制。
+   或者网页 https://docs.nvidia.com/cuda/parallel-thread-execution/#matrix-shape
 
 This example shows how to use split-k version of matrix multiplication using functions and data
 structures provided by CUTLASS; which we run on a NVIDIA Volta GPU.

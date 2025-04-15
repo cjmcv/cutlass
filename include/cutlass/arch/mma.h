@@ -244,10 +244,11 @@ struct SparseMma;
 //
 // Specializations for each compute capability
 //
-// <NT> mma.sync
+// <NT> mma.sync Ëæ¼Ü¹¹ÑÝ½ø
 //      sm70 volta, 
 //      sm75 turing, 
-//      sm80 ampere, sm89 Ada Lovelace.
+//      sm80 ampere, 
+//      sm89 Ada Lovelace, /?e?d?/ /?l?vle?s/
 //      sm90 hopper
 //      sm100 blackwell 
 //      => vtah

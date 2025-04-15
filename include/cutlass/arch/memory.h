@@ -38,7 +38,7 @@
 #include "cutlass/arch/cache_operation.h"
 #include "cutlass/platform/platform.h"
 
-// <NT> ldmatrix.sync / cp.async
+// <NT> ldmatrix.sync / cp.async Ëæ¼Ü¹¹ÑÝ½ø
 // // sm75 turing
 // ldmatrix.sync.aligned.x1.m8n8.shared.b16
 // ldmatrix.sync.aligned.x2.m8n8.shared.b16
