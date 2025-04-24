@@ -244,7 +244,7 @@ struct SparseMma;
 //
 // Specializations for each compute capability
 //
-// <NT> mma.sync 随架构演进
+// <NT>M mma.sync 随架构演进
 //      sm70 volta, 
 //      sm75 turing, 
 //      sm80 ampere, 

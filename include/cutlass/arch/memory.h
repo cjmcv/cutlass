@@ -38,7 +38,7 @@
 #include "cutlass/arch/cache_operation.h"
 #include "cutlass/platform/platform.h"
 
-// <NT> ldmatrix.sync / cp.async 随架构演进
+// <NT>M ldmatrix.sync / cp.async 随架构演进
 // // sm75 turing
 // ldmatrix.sync.aligned.x1.m8n8.shared.b16
 // ldmatrix.sync.aligned.x2.m8n8.shared.b16
@@ -47,7 +47,7 @@
 // ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16
 // ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16
 //
-// // sm80 ampere 新增异步拷贝指令
+// // sm80 ampere 新增异步拷贝指令, 此时优化开始采用multi-stage，而前面的sm75则采用two stage或叫double buffer 
 // cp.async.ca.shared.global.L2::128B              * 看memory_sm80.h开头笔记
 // cp.async.ca.shared.global
 // cp.async.cg.shared.global.L2::128B

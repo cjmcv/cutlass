@@ -38,7 +38,7 @@
 #include "cutlass/arch/synclog.hpp"
 #include "cutlass/detail/helper_macros.hpp"
 
-// <NT> 显卡架构演进和重大更新
+// <NT>M 显卡架构演进和重大更新
 // sm70 volta: 首次提出tensor core，开始支持mma，仅支持fp16。
 // sm75 turing: 一个warp的mma处理数据量增多，扩展int8和int4计算
 // sm80 ampere：一个warp的mma处理数据量进一步增多, 新增cp.async异步拷贝指令（用于multi-stage，之前的只能是同步的2-stage，即double-buffer）
