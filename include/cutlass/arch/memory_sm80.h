@@ -53,7 +53,7 @@
 // https://zhuanlan.zhihu.com/p/685168850
 // 限定符 .cg 表示仅在全局级别缓存 L2 而不在 L1 缓存数据。
 // 限定符 .ca 表示在所有级别缓存数据，包括 L1 缓存。
-// .L2::128B 表示允许预取的数据大小分别为 L2 中的 128 字节, 同理也对应有.L2::64B、.L2::256B
+// .L2::128B 表示允许预取的数据大小为 L2 中的 128 字节, 同理也对应有.L2::64B、.L2::256B
 //
 // https://forums.developer.nvidia.com/t/problem-about-ptx-instruction-cp-async-ca-shared-global/224219/2
 // 需要搭配__cvta_generic_to_shared进行地址空间转换后才能使用cp.async.ca.shared.global
