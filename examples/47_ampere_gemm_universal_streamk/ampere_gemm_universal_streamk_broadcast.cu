@@ -171,6 +171,8 @@ using DeviceGemmBasic = cutlass::gemm::device::GemmUniversalWithBroadcast<
     AlignmentA,
     AlignmentB>;
 
+// <NT> EVT: Epilogue Visitor Tree，用于组织和执行多个后处理的尾声操作的一种机制.
+// 介绍：https://juejin.cn/post/7474431357257154594
 // StreamK device GEMM implementation type with EVT
 using namespace cute;
 

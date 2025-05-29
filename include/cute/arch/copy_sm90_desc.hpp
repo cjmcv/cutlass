@@ -51,6 +51,29 @@
 
 namespace cute
 {
+// <NT> sm90 hopper 新增tma tensor，从gmem加载到smem，也是异步拷贝指令，跟sm80的类似。
+//                区别在于bulk.tensor是TMA指令，拷贝张量(支持1d到5d的tensor，数据量不固定)，支持gmem和smem的双向拷贝。
+//                ca.shared是普通拷贝指令(一次拷贝4/8/16字节)，仅支持gmem到smem单向拷贝。
+// TMA：Tensor Memory Accelerator，张量内存加速器，是hopper新增的硬件单元，通过cp.async.bulk.tensor使用。
+//
+// 字段解释：
+//   cp.async 异步拷贝；  bulk批量数据；  tensor拷贝目标是张量；
+//   shared::cluster 目标地址是集群级别的smem； global 源地址是gmem；
+//   mbarrier 使用内存屏障来同步拷贝操作； complete_tx 表示在拷贝完成时触发内存屏障；
+//   bytes 拷贝数据量以字节数为单位；
+//   * cluster级别smem：与之对应的是传统的smem，用于线程块内的数据共享。
+//                cluster smem是hopper架构提出，可在多个线程块之间共享数据，多个线程块组成一个cluster。
+//                shared::cluster 不需要通过全局内存完成同步，从而减少了同步的开销。
+//                需要利用到hopper架构的硬件级别的分布式共享内存（Distributed Shared Memory, DSM）
+//   L2::cache_hint 允许开发者为L2缓存提供访问提示，从而优化缓存行为。
+//   multicast::cluster 将数据从gmem广播到cluster内多个线程块的smem中。
+//   bulk_group：允许将多个异步操作（如 cp.async.bulk）捆绑在一起，形成一个group。这样可以更高效地管理多个异步操作。
+//               一般用于跨集群多个线程块之间共享相同数据，(shared::cluster 是同一个计算集群内的线程块之间共享数据)
+//
+// cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint
+// cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint
+// cp.async.bulk.tensor.1d.global.shared::cta.bulk_group
+//
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 /// Barriers are 64-bit of user-managed information used in broadly two types syncronization patterns

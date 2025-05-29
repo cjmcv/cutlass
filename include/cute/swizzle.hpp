@@ -36,6 +36,33 @@
 #include <cute/numeric/math.hpp>                // cute::max, cute::min
 #include <cute/algorithm/tuple_algorithms.hpp>  // cute::transform_apply
 
+// <NT> thread swizzle, marlin kernel中使用的解决bank冲突的案例
+// ldmatrix读取的是8x8的矩阵，正常访问会存在bank冲突, 通过异或做swizzle, 达到读写的conflict free。
+// swizzle方案, 列做异或: row=row, col=row^col; 
+// 如[1,0]->[1,1=1^0], [1,1]->[1,0=1^1], [1,2]->[1,3=二进制11=01^10], [1,3]=[1,2=10=01^11]
+// 二进制：0->000, 1->001, 2->010, 3-> 011, 4->100, 5->101, 6->110, 7->111
+// 0: 0 1 2 3 4 5 6 7   =>  0 1 2 3 4 5 6 7  (行是0->000与任何列做异或都不变)
+// 1: 0 1 2 3 4 5 6 7       1 0 3 2 5 4 7 6  (行是1->001)
+// 2: 0 1 2 3 4 5 6 7       2 3 0 1 6 7 4 5  (行是2->010)
+// 3: 0 1 2 3 4 5 6 7       3 2 1 0 7 6 5 4  (行是3->011)
+// 4: 0 1 2 3 4 5 6 7       4 5 6 7 0 1 2 3  (行是4->100)
+// 5: 0 1 2 3 4 5 6 7       5 4 7 6 1 0 3 2  (行是5->101)
+// 6: 0 1 2 3 4 5 6 7       6 7 4 5 2 3 0 1  (行是6->110)
+// 7: 0 1 2 3 4 5 6 7       7 6 5 4 3 2 1 0  (行是7->111)
+//
+// <NT> block swizzle提高数据局部性，triton的03-matrix-multiplication例子,分组。
+// 对于gemm 8*8*8为例，常规按一维block布局，计算一行c的8个block，需要读取a一行8个block和b所有的8*8个block, 共72个block。
+// 如果先计算c两行各前4个block，需要读取a的2行x8个block和b的4列x8个block，共48个block。
+// 分组设置：group_size_m=2, 行方向2行为一组，
+//          num_pid_in_group=16，一组共有16个block.
+// first_pid_m: pid // num_pid_in_group * group_size_m  =>  pid // 16 * 2 => (0-15)=0, (16-31)=2
+// row = first_pid_m + ((pid % num_pid_in_group) % group_size_m)  => first_pid_m + (pid%16)%2 => (0-15)=(01010101..) / (16-31)=(23232323...)
+// col = (pid % num_pid_in_group) // group_size_m                 => (pid%16)/2 => (0-15)=(0011223344...) / (16-31)=(0011223344...)
+// 结果如下，如0-7是聚集成子块的。
+//  0  1  2  3  4  5  6  7  =>   0  2  4  6  8 10 12 14 
+//  8  9 10 11 12 13 14 15       1  3  5  7  9 11 13 15
+// 16 17 18 19 20 21 22 23      16 18 20 22 24 26 28 30
+// 24 25 26 27 28 29 30 31      17 19 21 23 25 27 29 31
 namespace cute
 {
 
