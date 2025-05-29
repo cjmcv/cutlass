@@ -161,7 +161,8 @@ public:
 
     //
     // Allocate the GEMV workspace
-    //
+    // <NT> cutlass中的gemv定义是A矩阵为[M,K], B矩阵是输入矩阵x[1,K], 输出C矩阵[1,M]
+    //      等同于gemm中x充当A矩阵，gemv的A矩阵充当gemm的B矩阵。
 
     if(std::is_same<LayoutA, cutlass::layout::ColumnMajor>::value) {
       tensor_A.resize({problem_size.row(), batch_count * problem_size.column()});

@@ -819,11 +819,16 @@ Status GemmOperationProfiler::initialize_workspace(
 
   bool is_sparse = operation_desc.tile_description.math_instruction.opcode_class == cutlass::library::OpcodeClassID::kSparseTensorOp;
 
+  // <NT> 一个device会对应一个workspace，每个workspace主要有arguments记录计算相关的参数信息，configuration记录基本配置。
+  // 还有参与实际计算的ABCD等几个矩阵，这几个矩阵内存会跟据 problem_count 进行创建，problem_count由3*l2CacheSize为内存总量进行创建，可容纳几份就创建几份。
+  // 如果本身所需超过3*l2CacheSize则申请一份即可，这样可以避免for循环时上一次计算的时候留存在l2CacheSize上，导致本次计算性能虚高。
+  // 如 problem_count 为2，A矩阵申请内存时会创建2倍内存，for循环计算时，会按problem_count来逐份使用对应内存块，对应的数据和地址将与上一次计算的不一致。
   for (size_t i = 0; i < gemm_workspace_.size(); ++i) {
     cudaSetDevice(options.device.device_id(i));
 
     // Compute the number of copies of the problem to avoid L2 camping.
     if (!options.profiling.workspace_count) {
+      // <NT> 取ABC三个输入矩阵所需字节数的总量，如beta不为0，gemm中需要C矩阵的原始输入，则C矩阵按输入和输出两份算。
       int64_t bytes = problem_.bytes(operation_desc);
       if (bytes < 3 * int64_t(options.device.properties[0].l2CacheSize)) {
         gemm_workspace_[i].problem_count =
@@ -841,7 +846,7 @@ Status GemmOperationProfiler::initialize_workspace(
     if (allocate_device_tensors) {
       bool enable_deep_profiling = options.profiling.enable_kernel_performance_search;
       int seed_shift = 0;
-
+      // <NT> 按 problem_count 以倍数关系申请多份内存。
       // When exhaustive performance search (deep profiling) option is enabled, device buffers are initialized to the largest problem shape
       // so that later performance search can re-use those buffers.
       int init_m = enable_deep_profiling ? std::max(int(problem_.m),  problem_.problem_sizes.back().m()) : int(problem_.m);
@@ -1805,6 +1810,7 @@ Status GemmOperationProfiler::profile_cutlass_(
   auto launch_gemm = [&](int dev_id, cudaStream_t stream, int iteration) {
     int problem_idx = (iteration % gemm_workspace_[dev_id].problem_count) * problem_.batch_count;
 
+    // <NT> gemm_workspace_[dev_id].A 是A矩阵的内存池，gemm_workspace_[dev_id].arguments.A 是本次计算的目标。
     gemm_workspace_[dev_id].arguments.A = gemm_workspace_[dev_id].A->batch_data(problem_idx);
     gemm_workspace_[dev_id].arguments.B = gemm_workspace_[dev_id].B->batch_data(problem_idx);
     gemm_workspace_[dev_id].arguments.C = gemm_workspace_[dev_id].C->batch_data(problem_idx);
