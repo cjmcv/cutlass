@@ -176,6 +176,7 @@ CUTE_DEVICE uint32_t set_block_rank(uint32_t smemAddr, uint32_t rank)
 #endif
 }
 
+// <NT> 从warp里选举出一个线程，线程调用cute::elect_one_sync()返回lane_predicate为true，则表示该是被选举出来的线程，返回为false则表示未被选中。
 // Elect one thread in the warp. The elected thread gets its predicate set to true, all others obtain false.
 CUTE_HOST_DEVICE uint32_t elect_one_sync()
 {

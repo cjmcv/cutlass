@@ -53,6 +53,41 @@ namespace cutlass::gemm::collective {
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+// <NT> 参数分析
+//  * ClusterShape: hopper架构提出了cluster smem（分布式共享内存，DSM）的概念，位于L1和L2 Cache之间新增了一层SM-to-SM网络，
+// 使得同一个Cluster内的SM可以访问其他SM的Shared Memory，从而打破了传统上不同Thread Block之间无法直接通信的限制。
+// cluster的组成单元是sm（cutlass编程定义会使用block），一个cluster通常会由2/4/8/16个sm组成，hopper多为2/4, 如Shape<_1,_2,_1>
+//      
+// 1) smem和L1与L2之间的关系：
+//  smem和L1都在SM内，访存速度和数量都相近(L1通常比smem更接近计算核心)，二者共用部分资源，边界相对模糊，smem由开发者显式调用，L1由硬件自动管理(用于减少gmem访问次数)
+//  L2位于sm和gmem之间，对所有sm可见，延迟较高，由硬件自动管理，用于减少gmem的访问次数。
+// 2）DSM的数据流向：
+//  新增的SM-to-SM网络虽然用于smem共享，但是放在了L1和L2之间，由硬件自动管理，不对开发者暴露过多细节.
+//  基本路径: 源线程块的smem → 源SM的L1 Cache → 源SM的L2 Cache → 通过SM-to-SM网络 → 目标SM的L2 Cache → 目标SM的L1 Cache → 目标线程块的smem。
+// 
+// <NT> Kernel实现的底层函数，collective定义是 mma atoms和copy atoms被切分到的最大线程集合，提供了基础线程集合操作函数。
+// 核心函数: 
+// 1) can_implement: 每次计算前需要调用，检查当前参数能否正常运行。
+// 2) prefetch_tma_descriptors:发射 tma描述符预取，通过 预取TMA描述符，可以将数据提前加载到L2缓存中，一个warp仅需要一个线程来调用，warp内其他线程会自动协同工作，不需要重复调用。
+//                     调用例子：if ((warp_idx == 0) && lane_predicate) {
+//                                CollectiveMainloop::prefetch_tma_descriptors(params.mainloop);
+//                                CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);
+//                              }
+// 3) load_init: 为该collective设置用于 load和 mma 操作所需的数据，返回一个张量元组。该元组至少会有两个tensor，
+//               一个是gA_mkl，经过tile处理后的TMA张量，shape是[BLK_M,BLK_K,m,k,l]，另一个是gB_nkl[BLK_N,BLK_K,n,k,l]
+// 4) load / load_auxiliary: (生产者视角) 执行一个collective范围内的矩阵乘累加操作, load 对应普通的 ProducerWarpRole::Mainloop，而load_auxiliary对应ProducerWarpRole::MainloopAux
+// 5) load_tail: 执行一个生产者后处理操作，以防止集群中的线程块过早退出。
+// 6) mma: (消费者视角) 执行一个collective范围内的矩阵乘累加操作.
+// 7) mma_tail: 执行一个消费者后处理操作，以释放所有缓冲区。
+// 
+// kernel实现的外层函数位置，存放在kernel文件夹下，通过组合collective mainloop和collective epilogue构建而成的，当前文件实现的是collective mainloop。
+// include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp
+//                             sm90_gemm_tma_warpspecialized_pingpong.hpp
+//                             sm90_gemm_tma_warpspecialized.hpp
+//
+// device充当最外层封装，存放在device文件夹下，通过调用kernel的相关函数，完成计算。
+// include/cutlass/gemm/device/gemm_universal.h
+// 关系是 device => kernel => collective mainloop + collective epilogue
 
 // WarpSpecialized Mainloop
 template <
@@ -481,6 +516,14 @@ struct CollectiveMma<
       int thread_idx,
       uint32_t block_rank_in_cluster,
       TensorStorage& shared_tensors) {
+    // <NT> lane_predicate表示当前线程是否被选取出，true为是false为否。
+    // 一个warp里只需要一个线程调用具体拷贝指令，warp的其他线程会自动协同工作，不需要重复调用指令。
+    // 
+    // sA/sB中的s是smem的意思，对应存放到smem的A和B矩阵的tile，会使用tma来完成gmem到smem的数据加载；
+    // sSFA/sSFB则对应A和B的ScaleFactor，会根据数据量由 IsTmaLoadSFA / IsTmaLoadSFB判断选择是否也使用tma；
+    // 如果scale也使用tma，会在该load函数里一起加载，如果不使用tma，则会单独放到load_auxiliary中使用cp.async来加载scale。
+    // 很多时候因为scale数据量少，使用cp.async可以更灵活，且与tma可以并行执行，也避免浪费tma，加快AB矩阵的加载。
+    //
     int lane_predicate = cute::elect_one_sync();
     // Blockscaling: Tma loads for load_input and CpAsync for load_scale
     Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.data()), SmemLayoutA{});        // (BLK_M,BLK_K,PIPE)
@@ -514,6 +557,8 @@ struct CollectiveMma<
       mSFB_nkl, make_tile(Int<ScaleNsPerTile>{}, Int<1>{}),
       make_coord(n_coord,_,l_coord));
 
+    // <NT> S是src，D是dst，基于block_tma_a将数据分块，表示后续会将数据从tAgA搬运到tAsA。
+    // A和B直接使用tma，scaleA和scaleB会按数据量判断是否使用tma，如使用，其才做与AB的加载类似。
     // Applies the mapping from block_tma_a
     Tensor tAgA = block_tma_a.partition_S(gA);                                                 // (TMA,TMA_M,TMA_K,k)
     Tensor tAsA = block_tma_a.partition_D(sA);                                                 // (TMA,TMA_M,TMA_K,PIPE)
@@ -548,6 +593,9 @@ struct CollectiveMma<
     uint16_t mcast_mask_b = 0;
     uint16_t mcast_mask_sf = 0;
 
+    // <NT> 如果采用了multicast的策略，则需要准备tma的multicast用的掩码，指示哪个线程块需要接收数据；
+    // size<0>(block_layout)是cluster里一列有多少个线程块， size<1>(block_layout)是cluster里一行有多少个线程块，
+    // 先遍历线程块布局的每一列，取出行为cluster_local_block_id.x列为n映射得到的block_id, 生成一个掩码位。
     // Issue TmaLoads for GEMM operands A/B and CpAsync for scale tensors
     // Maps the tile -> block, value
     if constexpr (cute::is_same_v<GmemTiledCopyA, SM90_TMA_LOAD_MULTICAST>) {
@@ -564,6 +612,13 @@ struct CollectiveMma<
       }
     }
 
+    // <NT> 按k方向分块, 使用tma从gmem加载数据到smem。
+    // pipeline是MainloopPipeline类型，内嵌mbarrier指令，实现生产者消费者的栅栏管理。
+    // 在load           调用 pipeline.producer_acquire / producer_get_barrier
+    //   load_auxiliary 调用 producer_acquire / producer_commit
+    //   load_tail      调用 producer_tail
+    // 在mma调用 pipeline.consumer_try_wait / consumer_wait / consumer_release.
+    //   
     // Mainloop
     CUTLASS_PRAGMA_NO_UNROLL
     for ( ; k_tile_count > 0; --k_tile_count) {
@@ -773,6 +828,7 @@ struct CollectiveMma<
     static_assert(cute::is_void_v<SmemCopyAtomB>,
       "SM90 GMMA mainloops cannot have a non-void copy atom for smem sourced instructions.");
 
+    // <NT> 同样拿到对应区域的共享内存块，生产者将数据从gmem搬运到smem后，mma这里直接从smem里消费数据做计算。
     Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.data()), SmemLayoutA{});          // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.data()), SmemLayoutB{});          // (BLK_N,BLK_K,PIPE)
 
@@ -808,6 +864,9 @@ struct CollectiveMma<
                   size<0>(typename TiledMma::BLayout{}) == NumThreadsPerWarpGroup, 
                   "Stride of the first mode must be 0 and the size of the mode must be NumThreadsPerWarpGroup");
 
+    // <NT> TiledMma通常与ClusterShape强关联，TiledMMA在ClusterShape定义的cluster上执行计算，TiledMMA里的元素是线程。
+    // 一个warp组有128个线程，MmaWarpGroups看一个TileMMA里共有多少个warp组，以组的数量充当行，一组的128个线程充当列，得到warp_group_thread_layout。
+    // 按warp group取出thread_mma，表示为当前线程要计算的部分。
     constexpr int MmaWarpGroups = size(TiledMma{}) / NumThreadsPerWarpGroup;
     Layout warp_group_thread_layout = make_layout(Int<MmaWarpGroups>{}, 
                                                   Int<NumThreadsPerWarpGroup>{});
