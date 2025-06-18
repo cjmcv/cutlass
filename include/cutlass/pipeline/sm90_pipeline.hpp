@@ -43,6 +43,26 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/detail/dependent_false.hpp"
 
+// <NT> pipeline导读
+// sm90的pipeline主要有PipelineTmaAsync和PipelineAsync，用于数据在生产者(load)和消费者(mma)之间搬运流通，
+// 分别对应使用tma和使用普通的cp.async, 两个类型都带有Stages_参数，可分多阶流水处理，高效重叠数据加载和计算。
+// 消费者需要判断数据是否准备好，生产者需要判断消费者数据是否使用完成，底层会通过barrier来完成。
+// 
+// api分两类：
+//  1) 生产者api: producer_try_acquire / producer_acquire / producer_commit / producer_tail / producer_get_barrier / producer_expect_transaction
+//  2) 消费者api: consumer_try_wait / consumer_test_wait / consumer_wait / consumer_release
+// 关键变量：
+//  1）full_barrier_ptr_ / empty_barrier_ptr_: 两类api围绕这两个变量进行操作，内存由SharedStorage持有。
+//     SharedStorage会在pipeline以外的地方，基于smem进行创建。
+// 参数Params:
+//  1) is_leader: 通常取warpgroup(tma)/warp(cp.async)里面的第0号线程, transaction相关api会由is_leader线程执行，其他线程共享。
+//  2）role：一般取ThreadCategory::Producer / Consumer，如将0号warpgroup设为Producer，则里面所有线程的role都设置为Producer. 类似Consumer也一样。
+//  3）num_producers: producer的线程总数，即充当producer的warpgroup数量*每个warpgroup的线程数
+//  4) num_consumers: consumer的线程总数
+//  5）transaction_bytes: 一次tma传输涉及到的字节数
+//  6）initializing_warp: 常用默认值0，即使用0号warp作为代表去做初始化
+// barrier类型：见 include/cutlass/arch/barrier.h
+//  1）ClusterTransactionBarrier / ClusterBarrier 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -86,6 +106,10 @@ void pipeline_check_is_consumer(ThreadCategory role) {
   #endif
 }
 
+// <NT> 用于在单个 warp 中确定哪些线程是信号线程signaling_thread，
+// 这里32/16，即每2个线程中会有一个信号线程，而信号线程用于在多个线程之间进行同步、传递信号或协调工作。
+// 这里将这32个线程映射到 4x4 的网格layout中，即对应有4x4个dst_blockid，则每2个线程会协同处理一个block。
+// 协同处理一个block的两个线程中，会有一个线程是信号线程。
 CUTLASS_DEVICE
 cute::tuple<bool, uint32_t> spread_arrivals_to_warp(int thread_idx_in_warp) {
   constexpr uint32_t MaxClusterSize = 16;
@@ -96,7 +120,9 @@ cute::tuple<bool, uint32_t> spread_arrivals_to_warp(int thread_idx_in_warp) {
   uint32_t dst_blockid = layout(thread_row, thread_col);
   return cute::make_tuple(is_signaling_thread, dst_blockid);
 }
-
+// <NT> 用于在 warpgroup 中确定哪些线程是信号线程，并将线程映射到 4x4 的网格layout中。
+// 一个warpgroup是4个warp共128个线程，128/16=8，所以每8个线程会有一个信号线程。
+// 同理，4*32=128个线程对应4*4=16个块，每128/16=8个线程协同处理一个块，且这8个线程中会有1个是信号线程。
 CUTLASS_DEVICE
 cute::tuple<bool, uint32_t> spread_arrivals_to_warpgroup(int thread_idx_in_warpgroup, int warp_idx) {
   constexpr uint32_t MaxClusterSize = 16;
@@ -514,6 +540,8 @@ private:
     if (params_.is_leader) {
       full_barrier_ptr_[stage].arrive_and_expect_tx(params_.transaction_bytes);
     }
+
+    // <NT> brkpt指令会触发一个异常，中断当前的执行流程，调试器可以捕获这个异常，并允许开发者检查程序的状态、寄存器的值以及内存的内容
     #ifndef NDEBUG
     if (params_.role == ThreadCategory::Consumer || params_.role == ThreadCategory::NonParticipant) {
       asm volatile ("brkpt;\n" ::);
