@@ -352,6 +352,9 @@ struct TiledMMA : MMA_Atom
     return thr_tensor;
   }
 
+  // <NT> 通用的获取切片的操作，thr_idx是一个线程索引。但是分块可以指代wg的分块，block的分块或者全局的分块等，
+  // 而外面都需要将其转化为线程索引输入到这里，只不过如对应wg的分块，转换得到的线程id可能是0/128/256等。
+  // 又如block的分块，转换得到的线程id可能是0/512/1024等。
   template <class ThrIdx,
             __CUTE_REQUIRES(is_integral<ThrIdx>::value)>
   CUTE_HOST_DEVICE constexpr
@@ -362,6 +365,8 @@ struct TiledMMA : MMA_Atom
     return ThrMMA<TiledMMA, decltype(thr_vmnk)>{*this, thr_vmnk};
   }
 
+  // <NT> 获取线程级别的切片操作。功能上虽然与get_slice一致，但意思上有所区别，这里的thr_idx是线程id的意思。
+  // 在需要明确强调操作是针对线程时，应使用 get_thread_slice。该函数输入的线程id应不再像get_slice那样带有step。
   template <class ThrIdx,
             __CUTE_REQUIRES(is_integral<ThrIdx>::value)>
   CUTE_HOST_DEVICE constexpr
