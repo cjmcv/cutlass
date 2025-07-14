@@ -342,6 +342,10 @@ struct ThrCopy
   CUTE_HOST_DEVICE
   ThrCopy(ThrIdx const& thr_idx) : thr_idx_(thr_idx) {}
 
+  // <NT> Partition for src
+  // 把源stensor划分成 当前线程 要搬运的那一小块，输出当前线程要读出的fragment。
+  // 其中thr_tensor[num_threads_in_cta, tile_shape]，
+  // 第0维用 thr_idx_ 切片后就只剩当前线程负责的那一块。
   template <class STensor>
   CUTE_HOST_DEVICE
   auto
@@ -352,6 +356,8 @@ struct ThrCopy
     return thr_tensor(thr_idx_, _, repeat<rank_v<STensor>>(_));
   }
 
+  // <NT> Partition for dst
+  // 与partition_S对称，对应着目标dtensor，输出当前线程要写入的fragment。
   template <class DTensor>
   CUTE_HOST_DEVICE
   auto
@@ -362,6 +368,9 @@ struct ThrCopy
     return thr_tensor(thr_idx_, _, repeat<rank_v<DTensor>>(_));
   }
 
+  // <NT> 不依赖线程id，把全局张量 stensor 重新“铺平”成整组线程块级别的 tile 形状。
+  // partition_S中make_tensor用的是TiledCopy::tidfrg_S，而这里的是TiledCopy::retile。
+  // 输出整个 CTA 的 tile 视图（不切片）。
   template <class STensor>
   CUTE_HOST_DEVICE static
   auto
@@ -371,6 +380,7 @@ struct ThrCopy
     return make_tensor(static_cast<STensor&&>(stensor).data(), TiledCopy::retile(stensor.layout()));
   }
 
+  // <NT> 与retile_S对称，对应着目标dtensor，输出整个 CTA 的 tile 视图（不切片）
   template <class DTensor>
   CUTE_HOST_DEVICE static
   auto
@@ -461,6 +471,13 @@ make_tiled_copy_C_atom(Copy_Atom<CArgs...> const& copy_atom,
   return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
 }
 
+// <NT> 通过逻辑线程布局 (thr_layout) 和值布局 (val_layout) 直接映射到目标张量坐标，生成平铺复制操作器。
+// (M,N)坐标 → thr_layout → 线程索引 (thr_idx)
+// (M,N)坐标 → val_layout → 值索引 (val_idx)
+// 线程与值的组合 (thr_idx, val_idx) → 目标张量坐标
+// * 适用于线程和值需要明确对应到特定坐标的场景。
+// 文档：media/docs/cpp/cute/0x_gemm_tutorial.md
+
 /** Produce a TiledCopy from logical thread and values layouts.
  * The thread and value layouts map coordinates to thr_idx and val_idx.
  *    The product of these layouts is taken to produce the TV layout and the Tiler.
@@ -496,6 +513,12 @@ make_tiled_copy(Copy_Atom<Args...> const& copy_atom,
   return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
 }
 
+// <NT> 通过线程-值布局 (atom_tv_layout) 和数据布局 (data_layout) 的组合，生成平铺复制操作器。
+// (tid,vid)组合 → atom_tv_layout → 数据地址
+// 数据地址 → data_layout → 数据坐标
+// 线程与值的组合直接映射到数据地址，再转换为坐标。
+// * make_tiled_copy：适用于线程和值需要严格对应到特定坐标的场景，通过预定义布局直接构建映射关系，实现简单但灵活性较低。
+// * make_cotiled_copy：适用于线程和值更关注向量宽度和内存偏移的场景，通过线程-值到数据地址的映射，支持更灵活的内存访问模式，尤其适合向量化操作和不规则数据处理。
 /** Produce a TiledCopy from thread and value offset maps.
  * The TV Layout maps threads and values to the codomain of the data_layout.
  * It is verified that the intended codomain is valid within data_layout.

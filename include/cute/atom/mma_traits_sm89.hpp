@@ -50,6 +50,16 @@ using SM80_16x8_Row = Layout<Shape <Shape < _4,_8>,Shape < _2,_2>>,
 
 }
 
+// <NT>M MMA_Traits: MMA指令特性描述，sm89架构，该指令处理M×N×K => 16x8x32的mma块，
+// F32E4M3E4M3F32: 第一个F32指结果矩阵C为fp32类型，中间两个E4M3分别对应AB矩阵，最后一个F32对应acc。
+// ThrID：为32，即一个warp的线程数，该MMA指令是warp级别的指令，一次处理需要1个warp。
+// ALayout：Layout按Shape和Stride进行构建，其中的Shape由两个子Shape组成，第一个子Shape为4x8，表示将矩阵A切分成4x8个块。
+//          第二个子Shape表示每个块可以进一步分成4x2x2个子块，对应着A矩阵的数据：MxK => 16x32 => (4x8) x (4x2x2)
+//          # <NT-TODO> shape(4,8)对应stride(64,1) => 4行8列分块中，每列连续，每行间隔64，列方向有8份(4,8).
+//          # shape(4,2,2)对应 
+// BLayout：同理 NxK => 8x32 => (4x8) x (4x2)
+// CLayout: 同理 MxN => 16x8 => (4x8) x (2x2)
+// 文档: media/docs/cpp/cute/0t_mma_atom.md
 template <>
 struct MMA_Traits<SM89_16x8x32_F32E4M3E4M3F32_TN> {
   using ValTypeD = float;

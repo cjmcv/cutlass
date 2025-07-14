@@ -34,6 +34,19 @@
   memory
  */
 
+// <NT>M 开发调试函数
+// synclog / CUTLASS_HOST_TRACE      => -DCUTLASS_DEBUG_TRACE_LEVEL=1
+// cutlass::debug::dump_fragment     => tools/util/include/cutlass/util/device_dump.h
+// cutlass::debug::dump_shmem
+// cutlass::detail::TensorViewWrite  => tools/util/include/cutlass/util/tensor_view_io.h
+//
+// cute::print              => include/cute/atom/mma_atom.hpp
+// cute::print_latex
+// cute::print_latex_mma
+// cute::print_layout_mma
+// cute::print_layout       => include/cute/layout.hpp
+// cute::print_tensor       => include/cute/tensor_impl.hpp
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Standard Library includes

@@ -199,6 +199,7 @@ struct MMA_Atom<MMA_Traits<MMAOperation, Args...>>
 // A tiling of mma atoms
 //
 
+// <NT> 构建参数含义同上面的 make_tiled_mma 函数
 template <class TiledMMA, class ThrCoord>
 struct ThrMMA;
 
@@ -591,6 +592,14 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
                   decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
 }
 
+// <NT> MMA_Op：如cute::SM80_16x8x8_F16F16F16F16_TN{}; 
+//              每个原子操作处理16x8x8的子块。
+//      MMAThrLayout：一个线程所负责的数据块，如Layout<Shape<_2,_2>>{}表示一个线程处理2x2的数据块。
+//      Permutations：Tile类型，如Tile<_32,_32,_16>{}，表示矩阵被切分成32x32x16的tile。
+//                    即创建出来的TileMMA, 一次计算处理 A[32,16] x B[32,16] = C[32,32]
+// MMA_Op是warp级别操作，一个warp由32个线程，C的mn为[16,8], 刚好一个线程负责4个C的数据，可以布局为Layout<Shape<_2,_2>>。
+// 然后一个Tile为(32,32,16), 可由2x4x2次MMA_Op组成。
+// 文档：media/docs/cpp/cute/0t_mma_atom.md
 template <class MMA_Op,
           class MMAThrLayout = Layout<Shape<_1,_1,_1>>,
           class Permutations = Tile<Underscore,Underscore,Underscore>>

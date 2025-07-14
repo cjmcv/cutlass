@@ -314,6 +314,44 @@ struct SparseMma;
 // mma.sync.aligned.m16n8k4.row.col.f64.f64.f64.f64.rn
 // mma.sync.aligned.m16n8k8.row.col.f64.f64.f64.f64
 // mma.sync.aligned.m16n8k16.row.col.f64.f64.f64.f64
+// wgmma.mma_async.sync.aligned.m64n8k16.f16.f16.f16        *GMMA 64x24x16 F16+=F16*F16  include/cute/arch/mma_sm90_gmma.hpp
+//                      +16,32,64,96,128,196,256k
+// wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16
+//                      +16,32,64,96,128,196,256k
+// wgmma.mma_async.sync.aligned.m64n24k16.f16.f16.f16       *GMMA 64x24x16 F16+=F16*F16  include/cute/arch/mma_sm90_gmma_ext.hpp
+// wgmma.mma_async.sync.aligned.m64n40k16.f16.f16.f16
+//                                  +8k
+// wgmma.mma_async.sync.aligned.m64n248k16.f16.f16.f16
+// wgmma.mma_async.sync.aligned.m64n24k16.f32.f16.f16       *GMMA 64x24x16 F32+=F16*F16
+// wgmma.mma_async.sync.aligned.m64n40k16.f32.f16.f16     
+//                                  +8k
+// wgmma.mma_async.sync.aligned.m64n248k16.f32.f16.f16
+// 
+
+// <NT>M mma.sync 峰值性能数据 (以下都是稠密计算性能，对应稀疏计算的性能均翻倍)
+// 》》》ada：https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf
+// RTX4090:          int4       => 1321.2 TFLOPS 
+//                   int8       => 660.6 TFLOPS 
+//                fp8 + fp16acc => 660.6 TFLOPS 
+//                fp8 + fp32acc => 330.3 TFLOPS
+//               fp16 + fp16acc => 330.3 TFLOPS
+//          fp16/bf16 + fp32acc => 165.2 TFLOPS
+//                   tf32       => 82.6 TFLOPS 
+// RTX3090: fp16和bf16性能特点一致(fp16acc比fp32acc要快一倍)，比RTX4090性能刚好减半
+// L40:         int4 => 724 TFLOPS
+//          fp8/int8 => 362 TFLOPS
+//              fp16 => 181 TFLOPS
+//              tf32 => 90.5 TFLOPS
+// 》》》hopper: https://www.nvidia.cn/lp/data-center/resources/download-hopper-arch-whitepaper/
+// 
+// 》》》blackwell：https://images.nvidia.cn/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
+// RTX5090:       fp4 + fp32acc => 1676 TFLOPS  (没有int4？)
+//                   int8       => 838 TFLOPS 
+//                fp8 + fp16acc => 838 TFLOPS 
+//                fp8 + fp32acc => 419 TFLOPS
+//               fp16 + fp16acc => 419 TFLOPS
+//          fp16/bf16 + fp32acc => 209.5 TFLOPS
+//                   tf32       => 104.8 TFLOPS 
 
 #include "cutlass/arch/mma_sm50.h"
 #include "cutlass/arch/mma_sm60.h"
