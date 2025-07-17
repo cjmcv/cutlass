@@ -77,7 +77,7 @@ copy_if(PrdTensor                    const& pred,
 //    quantize(regs)：可能对寄存器数据进行量化，减少数据精度以提高计算效率
 // auto tCg = thr_copy.partition_D(gmem);
 // auto tCr = thr_copy.partition_S(quantize(regs));
-// auto tCc = thr_copy.partition_D(coord);
+// auto tCc = thr_copy.partition_D(coord); // 生成掩码时，需要用到坐标tensor
 // 4> 计算张量秩 (R)
 // group_modes：将张量的维度进行重组，将第 1 到 R 维合并为一个向量维度，便于向量化操作
 // 创建布尔型掩码张量 (tCp_v)，用于控制条件复制

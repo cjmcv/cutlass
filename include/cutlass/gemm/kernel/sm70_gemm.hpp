@@ -220,6 +220,10 @@ static_assert(is_valid_tile_scheduler, "SM70 kernel does not support specializin
     Tensor mA_mk = mA_mkl(_,_,l_coord);                                                                        // (m,k)
     Tensor mB_nk = mB_nkl(_,_,l_coord);                                                                        // (n,k)
 
+    // <NT> blk_coord_mnkl是线程块索引，以此充当coord对mA_mk进行分块操作，得到的gA就是该线程块所负责的数据块。
+    // gA[BLK_M,BLK_K,k]中BLK_M 和 BLK_K 是数据块的两个维度大小，k则k方向的分块数量。
+    // blk_shape是分块大小[BLK_M, BLK_N, BLK_K], Step<_1, X,_1>{}与之对应，取第0位和第2位的[BLK_M, BLK_K]。
+    // 同理Step< X,_1,_1>是取[BLK_N, BLK_K].
     // Slice to get the tiles this thread block is responsible for
     Tensor gA = local_tile(mA_mk, blk_shape, take<0,3>(blk_coord_mnkl), Step<_1, X,_1>{});           // (BLK_M,BLK_K,k)
     Tensor gB = local_tile(mB_nk, blk_shape, take<0,3>(blk_coord_mnkl), Step< X,_1,_1>{});           // (BLK_N,BLK_K,k)

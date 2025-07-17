@@ -1020,6 +1020,9 @@ outer_partition(Tensor    && tensor,
   }
 }
 
+// <NT> 将一个张量（或张量视图）按给定的块形状和步长 划分为 局部子块（tiles）.
+// 这里分块并不分配内存，只改变视图。常用于线程块的数据划分，如下例子所示，
+// 使用线程索引充当coord进行分块，使分块数据直接对应到线程块。
 // Tile a tensor according to @a tiler and use @a coord to index into the remainder, keeping the tile.
 // This is typical at the CTA level where tiles of data are extracted:
 //   Tensor data = ...                                                                         // (  M,  N)

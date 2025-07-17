@@ -199,7 +199,7 @@ struct MMA_Atom<MMA_Traits<MMAOperation, Args...>>
 // A tiling of mma atoms
 //
 
-// <NT> 构建参数含义同上面的 make_tiled_mma 函数
+// <NT> 构建参数含义同下面的 make_tiled_mma 函数
 template <class TiledMMA, class ThrCoord>
 struct ThrMMA;
 
@@ -592,13 +592,32 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
                   decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
 }
 
-// <NT> MMA_Op：如cute::SM80_16x8x8_F16F16F16F16_TN{}; 
-//              每个原子操作处理16x8x8的子块。
-//      MMAThrLayout：一个线程所负责的数据块，如Layout<Shape<_2,_2>>{}表示一个线程处理2x2的数据块。
-//      Permutations：Tile类型，如Tile<_32,_32,_16>{}，表示矩阵被切分成32x32x16的tile。
-//                    即创建出来的TileMMA, 一次计算处理 A[32,16] x B[32,16] = C[32,32]
-// MMA_Op是warp级别操作，一个warp由32个线程，C的mn为[16,8], 刚好一个线程负责4个C的数据，可以布局为Layout<Shape<_2,_2>>。
-// 然后一个Tile为(32,32,16), 可由2x4x2次MMA_Op组成。
+// <NT> MMA_Op：如cute::SM80_16x8x8_F16F16F16F16_TN{}; 每个原子操作处理16x8x8的子块(也叫Atom tile)。
+//      MMAThrLayout/atoms_layout：表示warp 内线程如何分配到 atom tile 的不同部分.
+//              如Layout<Shape<_2,_2,_1>>{}表示Atom tile被划分为 2×2=4个子tile。
+//              也叫ThrLayout，表示一个warp的 32 个线程被分组为 4 个 “逻辑线程组”，每个组 8 个线程，分别处理一个子 tile。
+//              原子tile (16x8)
+//                  ┌────────┬────────┐
+//                  │ Thread │ Thread │
+//                  │ Group0 │ Group1 │
+//                  │ (8thr) │ (8thr) │
+//                  ├────────┼────────┤
+//                  │ Thread │ Thread │
+//                  │ Group2 │ Group3 │
+//                  │ (8thr) │ (8thr) │
+//                  └────────┴────────┘
+//              即 1 条 MMA 指令被分解为 4 个子任务，这 4 个子 tile 的计算在 warp 内通过 SIMT 架构隐式并行执行。
+//              总之：MMAThrLayout 定义了一个 warp 内的 32 个线程如何分工协作执行一条 MMA 指令。
+//                   如 Layout<Shape<_1,_1,_1>>：32 个线程按顺序拼整个拼图。
+//                      Layout<Shape<_2,_2,_1>>：32 个线程分成 4 组，每组同时拼一个 1×4 的子拼图。设计本质上是在单个 warp 内增加细粒度并行度。
+//      Permutations：Tile类型，表示线程访问元素的顺序。如Tile<_4,_1,_1>表示线程在原子内按4个连续元素的顺序访问，0,0,0,0,1,1,1,1,...
+//              通常也表示的Tile的进一步切分，如设为[32,32,16],对于16x8x8的mma指令来说，可包含2x4x2次MMA_Op。
+//              例如：  	              Tile<32,32,16>	                           Tile<_1,_1,_1>
+//                    线程块处理区域	  32×32×16（M×N×K）	                          16×8×8（M×N×K，即单个 MMA 操作的尺寸）
+//                    MMA 操作数量      (32/16)×(32/8)×(16/8) = 2×4×2 = 16 次       1×1×1 = 1 次
+//                    并行度来源	      多 warp 并行执行多个 MMA 操作                单 warp 执行单个 MMA 操作
+//                    内存访问模式	    批量加载大块数据	                           每次只加载单个 MMA 所需数据
+//
 // 文档：media/docs/cpp/cute/0t_mma_atom.md
 template <class MMA_Op,
           class MMAThrLayout = Layout<Shape<_1,_1,_1>>,
@@ -630,7 +649,8 @@ partition_shape_C(TiledMMA<Args...> const& mma, Shape_MN const& shape_MN)
 
 }
 
-
+// <NT> 将输出矩阵C按照 warp-level GEMM 的 shape，
+// 为每个线程生成一个寄存器级别的 tile（fragment），用于存放当前线程负责的 MMA 计算结果。
 template <class... Args, class Shape_MN>
 CUTE_HOST_DEVICE constexpr
 auto
@@ -638,6 +658,25 @@ partition_fragment_C(TiledMMA<Args...> const& mma, Shape_MN const& shapeMN)
 {
   return make_tensor<typename TiledMMA<Args...>::FrgTypeC>(partition_shape_C(mma, shapeMN));
 }
+
+// <NT> partition_shape_A: examples/cute/tutorial/blackwell/01_mma_sm100.cu 中有以下注释：
+//  * SMEM layouts for A and B must match the post-partitioned (CTA-local) shapes expected by the MMA instructions.
+//  * CuTe provides partition_shape_[A|B] functions to determine the post-partitioned shape.
+//    These functions take the TiledMma, and the MMA Tile Shape as inputs and returns a shape that is at least rank-3
+//    where the first mode has the same shape as the MMA instruction, 2nd and 3rd mode expresses the number of time
+//    MMA instr is repeated in M/N mode and K mode of MMA tile, respectively.
+//  * Note that SMEM layouts are needed to determine SMEM allocation for kernel launch.
+// 翻译：
+//  * A和B的共享内存布局必须与MMA指令所期望的分区后（CTA本地）形状相匹配。
+//  * CuTe提供了partition_shape_[A|B]函数来确定分区后的形状。
+//    这些函数以TiledMma和MMA图块形状作为输入，并返回一个至少为3阶的形状，
+//    其中第一维的形状与MMA指令相同，第二维和第三维分别表示MMA指令在MMA图块的M/N模式和K模式中重复的次数。
+//  * 请注意，需要共享内存布局来确定内核启动时的共享内存分配。
+// 
+// 即partition_shape_A可以将 global矩阵形状 转换为适合 MMA 指令处理的local形状, 而返回的local shape是rank-3 的。
+//   第一维度 对应 MMA 指令的单次操作尺寸
+//   第二维度表示 M 方向上需要执行的 MMA 指令次数
+//   第三维表示 K 方向上需要执行的 MMA 指令次数。
 
 // partition_fragment_A and partition_fragment_B often depend on the
 //   layout of A and B and/or the thread_idx that is requesting the partition.

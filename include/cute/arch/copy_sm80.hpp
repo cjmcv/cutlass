@@ -169,7 +169,14 @@ cp_async_fence()
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// <NT> cp_async_wait<N> 表示等待当前异步缓冲区中最早的 N 条未完成的cp_async指令。
+// 与 cp_async_fence 的区别：
+// 同步原语	       cp_async_fence	                            cp_async_wait
+// 作用对象    所有之前的异步内存指令	                       指定数量（N）的异步内存指令
+// 阻塞程度	   轻量级：仅确保指令提交到硬件队列	              重量级：等待指令实际执行完成
+// 同步语义	   顺序保证：屏障前的指令必须先于屏障后执行	       完成保证：N=0，需要所有cp_async指令执行完毕；
+//                                                                  N>0, 等待到未完成的组数量 ≤ N
+// 典型场景	   分隔不同阶段的内存操作	                       等待数据可用以进行后续计算
 /// Blocks until all but N previous cp.async.commit_group operations have committed.
 template <int N>
 CUTE_HOST_DEVICE
