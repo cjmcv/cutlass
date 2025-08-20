@@ -32,7 +32,10 @@
 
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 
-
+// <NT> gemm/colletcive 是mma的mainloop的实现集合
+//      epilogue/collective 是epi的mainloop的实现集合
+// 整体层级关系是：gemm/device -> gemm/kernel -> gemm/collective mainloop + epilogue/collective 
+//                                                -> block/warp/thread           -> block/warp/thread
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "cutlass/gemm/collective/sm70_mma_twostage.hpp"

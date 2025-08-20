@@ -1023,6 +1023,14 @@ outer_partition(Tensor    && tensor,
 // <NT> 将一个张量（或张量视图）按给定的块形状和步长 划分为 局部子块（tiles）.
 // 这里分块并不分配内存，只改变视图。常用于线程块的数据划分，如下例子所示，
 // 使用线程索引充当coord进行分块，使分块数据直接对应到线程块。
+// 如: Step三维对应M/N/K，X表示固定不前进，1表示前进一个tile，则如下几行代码表示：
+//   gA随着blockIdx.x, blockIdx.y，每一步在M和K方向移动一个tile。同理，gB对应N/K方向，gC对应M/N方向。
+//   auto cta_tiler = make_shape(bM, bN, bK);
+//   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
+//   Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
+//   Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
+//   Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
+
 // Tile a tensor according to @a tiler and use @a coord to index into the remainder, keeping the tile.
 // This is typical at the CTA level where tiles of data are extracted:
 //   Tensor data = ...                                                                         // (  M,  N)

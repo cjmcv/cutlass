@@ -123,6 +123,8 @@ using ClusterShape        = Shape<_4,_2,_1>;                                // S
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
 using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;       // Kernel to launch based on the default setting in the Collective Builder
 
+// <NT> cutlass 3.0开始引入CollectiveBuilder，简化内核的模板参数选择。
+// collective分gemm和epi，分别对应kernel的mainloop和epi的处理逻辑。
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
     TileShape, ClusterShape,
@@ -144,6 +146,10 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     cutlass::gemm::collective::KernelScheduleAuto
   >::CollectiveOp;
 
+// <NT> kernel::GemmUniversal是基础类型 (gemm/kernel/gemm_universal.h)
+// 其核心模板参数有CollectiveMainloop和CollectiveEpilogue，会分别对应 gemm/collective 和 epilogue/collective。
+// 根据这些模板参数，会偏特化到 gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp， 
+//                            gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp 等
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int,int,int>, // Indicates ProblemShape
     CollectiveMainloop,

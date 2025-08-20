@@ -51,6 +51,7 @@
 
 namespace cutlass::gemm::kernel {
 
+// <NT> 偏特化的 GemmUniversal，对应 gemm_universal.h
 template <
   class ProblemShape_,
   class CollectiveMainloop_,

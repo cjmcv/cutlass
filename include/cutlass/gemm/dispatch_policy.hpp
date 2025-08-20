@@ -33,7 +33,7 @@
 // 容易导致资源浪费。warp专用化之后，构建了生产者消费者模式，负责mma的warp只做计算，使数据预取颗粒度从stage级别细化到了warp级别，数据送达更及时，
 // 且生产者和消费者数量可以调整，使负载更均衡，资源利用最大化。
 //      
-// <NT>M 调度策略，分kernel级别和Mainloop级别, Mainloop策略内嵌kernel策略
+// <NT>M 调度策略，分kernel级别和mma Mainloop(collective)级别, kernel内嵌Mainloop策略
 // Kernel 》》 
 // 1) KernelMultistage: 多级流水线，包含sm70的2阶和sm80/sm89的多阶，sm70没有异步的cp.async，只有同步的ldmatrix.sync
 // 2) KernelCpAsyncWarpSpecialized: cp.async是sm80提出的，sm90后也会沿用，而sm90在数据传输还有tma，所以会使用cp.async专门标记。同时使用了sm90提出的WarpSpecialize调度策略。

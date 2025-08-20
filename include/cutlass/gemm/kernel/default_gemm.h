@@ -295,7 +295,7 @@ struct DefaultGemm<ElementA, LayoutA, kAlignmentA, ElementB, LayoutB, kAlignment
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-
+// <NT> ampere架构常用的kernel级别的封装 kernel::DefaultGemm 。而sm90过后常使用 kernel::GemmUniversal，里面会包含少部分调度逻辑
 /// Partial specialization for Ampere Architecture
 template <
     /// Element type for A matrix operand

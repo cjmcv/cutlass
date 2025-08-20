@@ -592,7 +592,8 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
                   decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
 }
 
-// <NT> MMA_Op：如cute::SM80_16x8x8_F16F16F16F16_TN{}; 每个原子操作处理16x8x8的子块(也叫Atom tile)。
+// <NT> make_tiled_mma解析
+//      MMA_Op：如cute::SM80_16x8x8_F16F16F16F16_TN{}; 每个原子操作处理16x8x8的子块(也叫Atom tile)。
 //      MMAThrLayout/atoms_layout：表示warp 内线程如何分配到 atom tile 的不同部分.
 //              如Layout<Shape<_2,_2,_1>>{}表示Atom tile被划分为 2×2=4个子tile。
 //              也叫ThrLayout，表示一个warp的 32 个线程被分组为 4 个 “逻辑线程组”，每个组 8 个线程，分别处理一个子 tile。
@@ -610,6 +611,7 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
 //              总之：MMAThrLayout 定义了一个 warp 内的 32 个线程如何分工协作执行一条 MMA 指令。
 //                   如 Layout<Shape<_1,_1,_1>>：32 个线程按顺序拼整个拼图。
 //                      Layout<Shape<_2,_2,_1>>：32 个线程分成 4 组，每组同时拼一个 1×4 的子拼图。设计本质上是在单个 warp 内增加细粒度并行度。
+//                   MMAThrLayout很多时候也被命名为 kMmaEURepeatM / N / K，表示Tensor Core 执行单元（EU）的重复模式
 //      Permutations：Tile类型，表示线程访问元素的顺序。如Tile<_4,_1,_1>表示线程在原子内按4个连续元素的顺序访问，0,0,0,0,1,1,1,1,...
 //              通常也表示的Tile的进一步切分，如设为[32,32,16],对于16x8x8的mma指令来说，可包含2x4x2次MMA_Op。
 //              例如：  	              Tile<32,32,16>	                           Tile<_1,_1,_1>
@@ -617,6 +619,7 @@ make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
 //                    MMA 操作数量      (32/16)×(32/8)×(16/8) = 2×4×2 = 16 次       1×1×1 = 1 次
 //                    并行度来源	      多 warp 并行执行多个 MMA 操作                单 warp 执行单个 MMA 操作
 //                    内存访问模式	    批量加载大块数据	                           每次只加载单个 MMA 所需数据
+//              Permutations也被命名为kMmaVRepeatM/N/K。
 //
 // 文档：media/docs/cpp/cute/0t_mma_atom.md
 template <class MMA_Op,
