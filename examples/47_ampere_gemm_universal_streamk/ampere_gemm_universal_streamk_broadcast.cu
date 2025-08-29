@@ -442,16 +442,16 @@ typename DeviceGemmStreamK::Arguments args_from_options(
     {
       {
         {
-          {},                                                                                                          // Accum
+          {}, // Accum
           {tensor_Vector.device_data(), ElementC(0), {_0{}, _1{}, int32_t(options.problem_size.n())}},                 // Bias
-          {}                                                                                                           // Compute0
-        },                                                                                                             // EVTCompute0
+          {}  // Compute0
+        },    // EVTCompute0
         {tensor_c1.device_data(), ElementC(0), {options.problem_size.n(), _1{}, options.problem_size.mn().product()}}, // C1
-        {}                                                                                                             // Compute1
-      },                                                                                                               // EVTCompute1
+        {}    // Compute1
+      },      // EVTCompute1
       {tensor_c2.device_data(), ElementC(0), {options.problem_size.n(), _1{}, options.problem_size.mn().product()}},   // C2
-      {}                                                                                                               // Compute2
-    },                                                                                                                 // EVTCompute2
+      {}      // Compute2
+    },        // EVTCompute2
     {tensor_d.device_data(), {options.problem_size.n(), _1{}, options.problem_size.mn().product()}},                   // D
   };                                                                                                                   // EVTD
 

@@ -29,6 +29,15 @@
  *
  **************************************************************************************************/
 
+// <NT> CUTLASS 2 的DefaultGemmConfigurations存在局限：修改参数需重设全部参数，且每种配置组合需单独定义，扩展性差。
+// Hopper 架构新特性（如 TMA、warp 专业化）更是增加了配置空间，需要改进。
+//
+// CUTLASS 3 的CollectiveBuilder简化参数选择：
+//   基于少量参数自动决策（如数据加载策略）
+//   支持Auto参数自动选择调度和流水线级数（如计算最大可用流水线级数）
+//   主循环和 epilogue 构建器需保持调度一致性（均为Auto或兼容的具体策略）
+//   是便捷接口，核心 API 仍支持手动指定所有参数
+// 该例子演示不同配置下CollectiveBuilder的使用，说明其对批处理 GEMM 的自动支持，以及如何结合自定义 epilogue 访问树（EVT）实现 epilogue 融合。
 /*! \file
     \brief Hopper GEMM example leveraging collective operation builders.
 

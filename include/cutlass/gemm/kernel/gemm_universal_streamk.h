@@ -52,7 +52,16 @@ namespace gemm {
 namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-
+// <NT> stream-k的核心mainloop代码
+// 调用链路(对应demo 47_ampere_gemm_universal_streamk)：
+// 1) gemm::device::GemmUniversal           -> device/gemm_universal.h
+// 2)  gemm::device::GemmUniversalBase      -> device/gemm_universal_base.h
+// 3)  gemm::kernel::DefaultGemmUniversal   -> kernel/default_gemm_universal.h
+// 4）   gemm::kernel::DefaultGemm          -> kernel/default_gemm.h
+// 5)    gemm::kernel::GemmUniversalStreamk -> DefaultGemmUniversal中的SelectBase<SwizzleT, typename SwizzleT::StreamkFeature> 
+//                                             由模板参数gemm::threadblock::ThreadblockSwizzleStreamK 可选中该mainloop
+// 其中 Mma_在sm80下可能会选中   gemm::threadblock::MmaMultistage -> gemm/threadblock/mma_multistage.h
+//     ThreadblockSwizzle_ 会是 gemm::threadblock::ThreadblockSwizzleStreamK -> threadblock/threadblock_swizzle_streamk.h
 template <
   typename Mma_,                  ///! Threadblock-scoped matrix multiply-accumulate
   typename Epilogue_,             ///! Epilogue
@@ -952,6 +961,7 @@ protected:
       warp_idx,
       lane_idx);
 
+    // <NT> 以multi-stage为例，将会调用 include/cutlass/gemm/threadblock/mma_multistage.h 的 MmaMultistage::operator()
     // Perform this tile's range of multiply-accumulate (MAC) iterations
     mma(tile_work.k_iters_remaining, accumulator_tile, iterator_A, iterator_B, accumulator_tile);
 
@@ -1019,6 +1029,8 @@ protected:
     // Initialize tile work descriptor
     TileWorkDesc tile_work;
 
+    // <NT> dp: Data-Parallel, 一次就把一个输出 tile 的 K 维全部跑完，直接写回全局 C
+    //      sk: Stream-K, 只跑 K 维的一小段，把部分和写到全局 workspace，后续再由其它 SK/DP block 归约.
     bool dp_block = (block_idx >= dp_start_block_idx) && (block_idx < reduce_start_block_idx);
     bool sk_block = (block_idx < sk_padding_start_block_idx);
     bool reduce_block = (block_idx >= reduce_start_block_idx) &&
@@ -1072,6 +1084,7 @@ protected:
         separate_reduction(reduce_block_idx);
       }
 
+      // <NT> 不在dp或sk block 范围内的线程不需要参与后续计算，可以直接退出。
       return;
     }
 
@@ -1080,6 +1093,7 @@ protected:
     while (true)
     {
       // Perform this block's share of work for this tile
+      // <NT> 核心计算部分
       process_tile(
         tile_work,
         block_idx,
