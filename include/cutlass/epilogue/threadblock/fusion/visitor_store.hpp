@@ -144,6 +144,19 @@ struct VisitorAuxStore{
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(src_v); ++i) {
         bool guard = elem_less(coord_v(i), problem_shape);
+        // <NT> 里面封装cp.async.cg 或 st.global，for循环是为了通用，如果超过一次指令，会循环多次，否则只有一次
+        // VecType是128bit (上面有定义)，sizeof(VecType)=16, 对应struct global_store<AccessType, 16>，即一条st.global.v4.u32，也对应8个bf16.
+        //
+        // 在ThreadblockShape为mn=128*128的bf16下:
+        //   for循环为2，所以一个线程一次处理16个bf16，总共8个step，即处理16*8=128个bf16；一个block共128个线程，则一个block负责128*128个bf16.
+        //   如end_step中加限制，指定仅运行某一个块，会发现一个block对应的就是128*128的完整的tile。
+        //   注意：for循环中两次迭代的数据并不连续，如需按end_step来同步通信，只能一个信号量对应8个bf16.
+        // 
+        //   如需要基于block进行连续数据的同步，需要加函数，并通过到达 end_epilogue 的 block来确认该完整的128*128的tile是否已经完成计算。
+        //   CUTLASS_DEVICE void
+        //   end_epilogue() {}
+        //   注意: blockIdx.x == threadblock_tile_offset.m() => m,  x 对应 行
+        //         blockIdx.y == threadblock_tile_offset.n()=> n;  y 对应 列
         cutlass::arch::global_store<VecType, sizeof(VecType)>(src_v(i), (void*)&dst_v(i), guard);
       }
     }
@@ -161,7 +174,18 @@ struct VisitorAuxStore{
       make_gmem_ptr(params_ptr->ptr_aux),
       problem_shape,
       params_ptr->dAux);   // (M,N,L)
+    // <NT> 为了同时支持GEMM、Batched GEMM、Grouped GEMM、3-D卷积等场景，
+    // epilogue 把输出张量 C 的 OutputTileThreadLayout 坐标约定成 6 个维度：
     // VECTOR, FRAGMENT_COLUMN, FRAGMENT_ROW, ITERATION_ROW, ITERATION_GROUP, ITERATION_CLUSTER
+    //   0             1             2              3               4                5
+    //
+    // 使用group_modes<3,6>将6维中的[3,6)，即第3/4/5维压缩成1维，得到：
+    // tC_gAux(idx_0, idx_1, idx_2, idx_3_4_5).
+    // 最后一个维度是ITERATION_ROW, ITERATION_GROUP, ITERATION_CLUSTER的合集，使用step_idx进行访问
+    // 如 tC_gAux(_,_,_,step_idx)，因为使用了recast<VecType>修饰，所以一次取出一个VecType的数据量。
+    // 如果没有使用recast<VecType>修饰，则一次取出一个标量。
+    //
+    // 使用时，auto dst_v = filter(tC_gAux(_,_,_,step_idx))中，filter是起到越界保护和条件过滤的作用。
     Tensor tC_gAux = recast<VecType>(group_modes<3,6>(ThreadMap::partition(mAux, thread_idx, threadblock_tile_offset)));
     Tensor tC_rAux = make_tensor_like(take<0,3>(tC_gAux));
 

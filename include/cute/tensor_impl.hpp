@@ -490,7 +490,14 @@ make_coord_tensor(Layout const& layout)
 // make_identity_tensor
 //   Make a tensor that maps coordinates within a shape to themselves.
 //
-
+// <NT> 创建一个 Tensor，它的内容不是数值，而是每个元素的 坐标索引。
+// 使用例子：Tensor t = make_identity_tensor(make_shape(4, 8));
+//          print_tensor(t);
+// 得到：(0,0) (0,1) (0,2) ... (0,7)
+//      (1,0) (1,1) (1,2) ... (1,7)
+//      ...
+//      (3,0) (3,1) (3,2) ... (3,7)
+// 每个位置的值就是 (row, col) 本身，常用于 边界判断。
 template <class Shape>
 CUTE_HOST_DEVICE constexpr
 auto
@@ -688,6 +695,7 @@ filter(Tensor<Engine,Layout>&& tensor) {
   return make_tensor(tensor.data(), filter(tensor.layout()));
 }
 
+// <NT> [Begin, End), 左闭右开，group<2,4>表示将原始6维度的第2和第3维合并，得到新的5维数据
 // Group the modes [B,E) into a single mode
 // e.g. group<2,4>(make_tensor<int>(Layout<Shape<_1,_2,_3,_4,_5,_6>>{}))
 //      => make_tensor<int>(Layout<Shape<_1,_2,Shape<_3,_4>,_5,_6>>{})
@@ -993,6 +1001,13 @@ inner_partition(Tensor    && tensor,
   }
 }
 
+// <NT> 把一个张量按某个 tile 模式切分后，取出“tile 之外”的部分，并保留 tile 在张量中的原始布局信息。
+// 如：auto [A_blk, A_rest] = outer_partition(A, make_shape(32, 64), make_coord(1, 0));
+// A_blk 是第 (1, 0) 个 tile 对应的张量片段（原始张量中 (32:64, 0:64) 的部分）。
+//       其中make_shape(32, 64)表示一个tile大小是(32, 64)，第 (1, 0) 个 tilei表示取第1行第0列块，即(32:64, 0:64)。
+// A_rest 是 除了这个 tile 之外的张量剩余部分，但保留 tile 的原始布局信息。
+// 该函数常用于边界处理。
+//
 // Apply a Tiler to the Tensor, then slice out the remainder by slicing into the "Tile" modes.
 // With an outer_partition, you get everything that's outside the Tiler. The layout of the Tile in the Tensor.
 // Split the modes of tensor according to the Tiler

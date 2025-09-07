@@ -390,7 +390,9 @@ struct global_store;
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-
+// <NT> st.global.v4.u32: st 存数据到 global 内存，一次4个元素，每个元素32位，即一次128位=16个8位
+// 所以 global_store<AccessType, 64> 是一次存放16个32位元素2=512位。
+// pred_guard为true时，@p的四条指令正常运行，为false则跳过。
 template <typename AccessType>
 struct global_store<AccessType, 64> {
   CUTLASS_DEVICE
