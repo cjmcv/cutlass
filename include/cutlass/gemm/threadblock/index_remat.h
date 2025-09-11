@@ -43,6 +43,14 @@ namespace gemm {
 namespace threadblock {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+// <NT> rematerialize辅助函数：重新计算 threadIdx/blockIdx，用来减少寄存器生命周期（从而省寄存器）
+// CUDA 内核里如果直接保存 threadIdx.x 到局部变量：如 int tidx = threadIdx.x; 编译器会 把 bx 留在寄存器里一直不释放，直到最后一次使用。
+// 而Rematerialize的做法是 用内联函数 int bx = RematerializeBlockIdxX(); 每次用到时都重新去读特殊寄存器 SR_BLOCKIDX_X，不再用局部变量缓存。
+// 代价：多读一次特殊寄存器，1 cycle 延迟，几乎免费。  收益：省 1 个寄存器/线程，1024 线程就能省 1k 寄存器，
+//
+// 疑问分析：int bx = RematerializeBlockIdxX() 中bx也会放在寄存器，还有何区别。
+// 答：区别在于编译器的动作，int bx = blockIdx.x 强制产生“mov rX, SR_BLOCKIDX_X”。
+// 而 RematerializeBlockIdxX() 让编译器 “把 SR_BLOCKIDX_X 直接当立即数”，从而真正省掉一条 MOV 和一个 live 寄存器。
 
 /// Helper to rematerialize block Idx. Reduces register liveness.
 CUTLASS_DEVICE

@@ -29,6 +29,11 @@
  *
  **************************************************************************************************/
 
+// <NT> 展示了如何组装一个自定义 GEMM 核函数：
+// 该核函数会直接明确指定集合操作（Collectives），而非使用构建器（builder）；（与examples 49的主要区别）
+// 同时在这一过程中，会实例化一个效率更高的收尾段（Epilogue）
+//（来自头文件cutlass/epilogue/collective/sm70_epilogue_vectorized.hpp），而非使用默认收尾段。
+
 /*! \file
     \brief Hopper GEMM example to create a GEMM kernel with custom Collectives
 

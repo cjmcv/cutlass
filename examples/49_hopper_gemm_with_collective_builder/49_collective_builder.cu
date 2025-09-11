@@ -37,7 +37,9 @@
 //   支持Auto参数自动选择调度和流水线级数（如计算最大可用流水线级数）
 //   主循环和 epilogue 构建器需保持调度一致性（均为Auto或兼容的具体策略）
 //   是便捷接口，核心 API 仍支持手动指定所有参数
-// 该例子演示不同配置下CollectiveBuilder的使用，说明其对批处理 GEMM 的自动支持，以及如何结合自定义 epilogue 访问树（EVT）实现 epilogue 融合。
+// 该例子演示不同配置下CollectiveBuilder的使用，说明其对批处理 GEMM 的自动支持，
+// 以及如何结合自定义 epilogue 访问树（EVT）实现 epilogue 融合。(与examples 48的主要区别是EVT)
+
 /*! \file
     \brief Hopper GEMM example leveraging collective operation builders.
 

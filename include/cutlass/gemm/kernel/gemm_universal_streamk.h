@@ -62,6 +62,30 @@ namespace kernel {
 //                                             由模板参数gemm::threadblock::ThreadblockSwizzleStreamK 可选中该mainloop
 // 其中 Mma_在sm80下可能会选中   gemm::threadblock::MmaMultistage -> gemm/threadblock/mma_multistage.h
 //     ThreadblockSwizzle_ 会是 gemm::threadblock::ThreadblockSwizzleStreamK -> threadblock/threadblock_swizzle_streamk.h
+
+// <NT> stream-k的基本思路
+// 与stream-k对应的两种实现，分别是DP和split-k。
+// * DP (data-parallel) 是典型实现，把k维度一次跑完，每个 CTA 独立处理一个输出 tile，无需跨 CTA 同步或归约，算力利用率高。
+//     缺点：1）当tile数量不是sm数量的整数倍时，wave quantization 问题严重 (如共100个sm，铺完整份数据需要120个block，则有20个sm会计算两份，则整体时间按两次算)。
+//          2）针对K非常大M/N很小的情况，因为一个block需要把K完整算完，计算量很大，但M/N方向小，则可以同时计算的block数量少，导致sm无法都被用起来。
+// * split-k 把 K 切成固定段，最后要一次全局归约。能解决DP的第2个缺点，每个tile压力减小，段数等同于M/N方向，可以分出sm并行计算。
+//     缺点：同样存在wave quantization问题，但能解决DP的第2个缺点。
+// * stream-k 优化split-k，弱化wave的概念，
+//     与split-k的本质区别：split-k是固定顺序，哪些sm负责哪些tile，在启动时就已经确定；
+//                        而stream-k是抢任务，哪个sm有空就哪个sm上，哪个sm负责哪个tile在运行之前是不确定的。
+//                     所以stream-k在启动前需要先设定一共要启动多少持久 CTA。每个持久 CTA 在内部 while-loop 里通过 atomic 抢迭代，直到把全局迭代池吃光。
+//     缺点：会存在tile-processing skew，因为sm命中区域是乱序的，所以L2命中率会比按顺序的split-k要低。只能从sm的使用率方面起到加速效果。
+//
+// 概念补充：
+//    DP 和 streamk 均与 multistage 是不同层级的策略，multistage搭配DP和streamk使用，
+//  与 tile 分配无关，作用于主循环。而DP和streamk则主要针对tile的分配问题。
+//  在sm80/86/89都默认使用multistage（cp.async），sm75使用two-stage（ldmatrix.sync）。可回看 include/cutlass/arch/memory.h
+
+// <NT> stream-k的实现主体概述
+// 主体框架是先使用DP，再使用stream-k的方式进行，分别对应 dp_block 和 sk_block
+// 用 DP 吃掉“大块且对齐”的计算，保证缓存友好；用 Stream-K 只啃“尾巴”零碎 tile，把 SM 利用率打到 100 %，
+// 同时把stream-k所需要做的 同步和 skew 限制会被限制在最后一两个 tile 里（最后一个wave）。
+
 template <
   typename Mma_,                  ///! Threadblock-scoped matrix multiply-accumulate
   typename Epilogue_,             ///! Epilogue
