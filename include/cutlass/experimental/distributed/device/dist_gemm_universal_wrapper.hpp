@@ -45,6 +45,45 @@
 #include "cutlass/experimental/distributed/device/full_barrier.hpp"
 #include "cutlass/experimental/distributed/device/detail.hpp"
 
+// <NT> 计算融合通信实操记录 双卡L40 (PCIE-PXB) gemm + allreduce(cuda ipc)
+// * cuda ipc仅支持P2P的PXB/PIX/NVLINK，其中PXB和PIX是pcie) 更多信息见(nvshmem:src/host/topo/topo.cpp)
+//
+// 做法：
+// * 生产 (只有到达标志需要通信)：
+// 1）在VisitorAuxStore的end_step()中将结果直接自身的共享内存rank_data上，由其他GPU可见。
+// 2）在end_epilogue()中，根据达到的tile进行信号量置位。其中streamk和splitk会存在一个tile达到多次的情况。
+// 3）本地开多个buffer，flag_c用于记录当前到达的tile是第几个到达的，并充当下标写到flag_v上。
+//    flag_v里每个元素都是 多个GPU 都已到达的tile。
+// 4）创建共享buffer存到到达标志，self_flag_e对应自身的共享内存标志，总长度是tile总个数，当某个tile达到时，会将tile id作为下标，
+//    在self_flag_e对应位置上自加1，然后判断其他GPU的target_flag_e对应位置的数值是否与self_flag_e的一致，
+//    如一致则表示双方GPU的该tile都已经完成，可以进行通信。tile id号记录到flag_v里。
+// * 消费（通信目标数据）：
+// 1）单独写一个kernel，使用另外的stream启动，各个block访问本地的flag_v，领取里面被记录了的tile id。
+//    然后进行通信并与本地数据相加。一个block负责一个tile，循环将所有tile传输完，要注意使用向量化的合并访问。
+//
+// 现象：
+// 1）KN=8192下，M=1~256时按单stream处理，gemm输出与allreduce输入绑定，减少一次gmem读写，有轻微收益。
+//    如果走tile层级的overlap，则会有负收益。当M>512, tile层级overlap效果凸显，可达1.34x收益。
+//    M超过4096后收益降低，可以循环m维度来解决。
+// 2）KN=4096下，M=1~512时按单stream处理，同8192有一定收益。当M>1024时，tile层级overlap效果凸显，可达1.2x收益。
+// 3）KN=2048下，M=1~16384 全程的tile层级overlap均无法拿到收益。KN越小，tile级别overlap效果越差。
+// 4) gemm的计算量是2*M*N*K, 而通信量是M*N, 因此通信占比取决于K，M变化不会对通信占比有明显影响。
+//    以gemm+nccl为例，忽略M<128的情况（可能启动耗时占有一定比例，数据体现不太准确）.以M>256, 在NK=2048下，通信耗时占比约80%；NK=4096时为65%；NK=8192时为35%。
+//    所以KN=2048，通信占比非常大，且通信依赖gemm，gemm无法掩盖通信耗时。KN=4096时，tile层级overlap才开始发挥作用。KN=8192时效果最佳。
+//    
+// 小数据量无收益的问题：
+// 1) L40的sm数量为142个，如一个block为128*128，则一个wave下来可以处理128*128*142的数据。
+//    转换成NK=8192的gemm时，可以处理284行，超过了256，即对于MNK=256*8192*8192的gemm下，一个wave即可完成。
+//    则所有sm几近于相同时间结束，没有足够的时间差来重叠通信。因此效果在M=256以下，几乎没有overlap收益，M继续增大后才会有。
+// 2）小数据量下，gemm趋向于访存受限，计算时间短，数据写回时间长，而通信同样对内存带宽有高要求。
+//    此时二者同时启动会存在竞争带宽的问题，导致相互拖慢。
+// 3）同第二点，两个kernel都在写内存，容易导致L2 cache被污染，也会导致相互拖慢。
+//    随着数据量增大，gemm变成访存受限，写内存的时间占比小，则2和3的问题可以得到改善。
+// 
+// 超大数据量下无收益的问题：
+// 1）gemm的计算量是2*M*N*K, 而通信量是M*N，在K超大时，通信耗时占比非常小，即使完全隐藏也收益不明显。
+// 2）如果只是M增加，可以用循环m来缓解.
+
 ////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::distributed::device {

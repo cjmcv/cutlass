@@ -52,8 +52,9 @@ namespace gemm {
 namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// <NT> stream-k的核心mainloop代码
+// <NT> stream-k的核心mainloop代码 
 // 调用链路(对应demo 47_ampere_gemm_universal_streamk)：
+//
 // 1) gemm::device::GemmUniversal           -> device/gemm_universal.h
 // 2)  gemm::device::GemmUniversalBase      -> device/gemm_universal_base.h
 // 3)  gemm::kernel::DefaultGemmUniversal   -> kernel/default_gemm_universal.h
@@ -148,6 +149,8 @@ public:
   // Structures
   //
 
+  // <NT> batch_count：在kBatched模式下就是batch，但在kGemm模式下可充当split-k参数用(2则k分两段)
+  //      avail_sms: 专用于stream-k的参数，将尝试在指定数量的 SM 之间进行负载均衡（其中 - 1 表示默认使用设备的全部 SM 数量，1 表示采用传统的数据并行调度方式）
   /// Argument structure
   struct Arguments {
 

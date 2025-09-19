@@ -150,13 +150,18 @@ struct VisitorAuxStore{
         // 在ThreadblockShape为mn=128*128的bf16下:
         //   for循环为2，所以一个线程一次处理16个bf16，总共8个step，即处理16*8=128个bf16；一个block共128个线程，则一个block负责128*128个bf16.
         //   如end_step中加限制，指定仅运行某一个块，会发现一个block对应的就是128*128的完整的tile。
-        //   注意：for循环中两次迭代的数据并不连续，如需按end_step来同步通信，只能一个信号量对应8个bf16.
-        // 
+        //   注意：1）for循环中两次迭代的数据并不连续，如需按end_step来同步通信，只能一个信号量对应8个bf16.
+        //        2）合并访问的定义： 同一个 warp（32 线程）中的线程访问全局内存时，如果访问的地址是连续的、对齐的，GPU 会把这些访问合并成一次或几次高效的内存事务。
+        //           如有一个block为128个线程共4个warp去处理128*128的float类型的tile，则一个warp32个线程完成一行数据的处理，每个warp需要循环128/4次，这样会是一个高效的实现。
+        //           如此，有两种写法：1> 向量化，一般按128bit为一个向量(对应ld.128/st.128指令)，如float4为单位进行读写，其次取64bit也行，一个线程负责一个向量，32个线程负责连续的多个向量。
+        //                           2> 逐元素，一个线程负责一个元素，32个线程负责连续的32个元素。
+        //                           注意：如一个线程连读多个连续的元素，必须以向量化的方式进行，直接for循环逐个读，编译器会进行事务拆分，导致非合并访问。
+        //           一个 128 字节缓存行 内（float = 4 字节 → 128 字节 = 32 个 float）
         //   如需要基于block进行连续数据的同步，需要加函数，并通过到达 end_epilogue 的 block来确认该完整的128*128的tile是否已经完成计算。
         //   CUTLASS_DEVICE void
         //   end_epilogue() {}
-        //   注意: blockIdx.x == threadblock_tile_offset.m() => m,  x 对应 行
-        //         blockIdx.y == threadblock_tile_offset.n()=> n;  y 对应 列
+        //   注意: blockIdx.x == threadblock_tile_offset.m() => m,  x 对应 行？
+        //         blockIdx.y == threadblock_tile_offset.n()=> n;  y 对应 列？
         cutlass::arch::global_store<VecType, sizeof(VecType)>(src_v(i), (void*)&dst_v(i), guard);
       }
     }

@@ -52,7 +52,7 @@ namespace threadblock {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-// <NT> 对应最“轻量级”的一种 Threadblock → CTA 映射策略 —— GemmIdentityThreadblockSwizzle<N> (identity swizzle)，
+// <NT> GemmIdentityThreadblockSwizzle: 对应最“轻量级”的一种 Threadblock → CTA 映射策略 —— identity swizzle，
 // 1. 把 逻辑 tile 网格（M×N×K_split） 翻译成 CUDA grid 尺寸(blockIdx.x, blockIdx.y, blockIdx.z)；
 // 2. 把 blockIdx.{x,y,z} 再反向映射回 逻辑 tile 坐标 (m,n,k)，但中间可以按模板参数 N 做一点 2^N 阶的 x-y 转置/swizzle，
 // 目的是让 同一行（m 方向）的 tile 在物理上不要连续落地到相邻 SM，从而 缓解 L2 冲突、提高 L2 命中率，同时 保持零开销（纯位运算）。
@@ -73,6 +73,26 @@ namespace threadblock {
 // swizzle的做法：
 //   把 blockIdx.x 的高 2 位和 blockIdx.y 的低 2 位交换，相当于 把 n 的“高位”挪到 m 的“低位”，于是 连续 n 号不再是连续地址，set 位被 XOR 打乱，
 // 同一 wave 的 tile 落在不同 set，冲突消失。
+
+// <NT> 内存分类：global->L2->L1TEX->LSU(load-store unit)->reg
+// global-片外 / L2-片内SM外 / L1TEX-SM内（与smem共享）/ reg-SM内与ALU处于同一pipeline
+// 
+// L1TEX（Load/Store + Texture 单元），同时承担三个功能：
+//    1）传统的L1 cache；
+//    2）Texture cache；
+//    3）smem：同一块物理 SRAM 可配置成16/32/48/64/100/128 kB 的 Shared Memory，剩余部分当 L1。
+//            所以smem分多了，L1就少，通过 cudaFuncSetAttribute() 的 preferredSharedMemoryCarveout 可以调节比例。 
+// L2缓存命中率：
+//   场景：计算一个向量加法，从gmem读取，计算后写回gmem，全程不经过smem，也没有数据复用，但是L2命中率为100%，如何理解？
+//    答：L2 缓存作为全局内存与 L1 缓存之间的桥梁，具有自动预取和写缓存功能。
+//       读操作：当warp以连续模式访问全局内存，L2 缓存会启动硬件预取器（prefetcher），提前将后续可能访问的内存块加载到 L2 中。
+//       写操作：写回全局内存时，数据并非直接写入显存，而是先写入 L2 缓存的写合并缓冲区，被统计为命中。
+// L1TEX缓存命中率：
+//    场景：同样的向量加法，但L1TEX命中率为0
+//     答：L1(如每 SM 64KB)的核心目标是降低单次访问延迟(约 20-30 个时钟周期），为线程束提供极快的临时数据访问。
+//      如果没有数据复用（向量加就是没有复用的），编译器可能会直接绕过（直接使用L2路径），避免L1浪费。而且本身量小，容易被后来数据污染。
+//         L2(全 GPU 共享，通常 1-6MB)的核心目标是减少全局内存访问量，更侧重批量数据处理，预取机制更强大，
+//      可通过预取覆盖连续的大块数据，即使无复用也能通过 “一次预取、多次命中” 实现高命中率
 
 /// Threadblock swizzling function for GEMMs
 template <int N = 1>

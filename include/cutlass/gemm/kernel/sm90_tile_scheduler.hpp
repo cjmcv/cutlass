@@ -35,6 +35,23 @@
 namespace cutlass::gemm::kernel::detail {
 
 ///////////////////////////////////////////////////////////////////////////////
+// <NT> PersistentTileSchedulerSm90: 派生于StaticPersistentTileScheduler基类，负责提供 persistent-loop 骨架（while 还有 tile 就继续领）。
+// 但实现只需要实现get_work_idx_m_and_n()，不需要写循环逻辑。因此 PersistentTileSchedulerSm90 具备 persistent 能力，但是否“真的持久”由 launch 端决定。
+// IsDynamicPersistent = false 表示 非动态 persistent，即不会 在运行时把剩余 tile 计数器放进 global memory，也不支持跨 CTA 抢任务。
+// TODO...
+//
+// <NT> presistent thread 模式的官方定义: A kernel is persistent if the number of CTAs launched is independent of the total amount of work, and each CTA iterates until all work is consumed.
+// 关键词是iterates，只要存在 “for / while 循环” 让同一 CTA 连续处理 ≥1 个 work unit，就算 persistent；启动的CTA和工作量可以解耦。
+// 如：最原始的CUDA写法DP模式，按grid给矩阵划分tile，每个block处理一个tile，每个block完成一次任务后退出，即可结束。
+//    当矩阵增大时block的数量也更多，则不属于 persistent。属于最传统的 grid-level non-persistent 启动模型。
+// 如：streamk的是 常驻不退出，自己领任务，block数量与任务量解耦，属于典型的 persistent。
+//    SM90使用的PersistentTileSchedulerSm90StreamK，实现 K 段级 persistent。
+// 如：这里的PersistentTileSchedulerSm90，针对的是与streamk同级别相对应的DP模式，
+//    通过PersistentTileSchedulerSm90使DP也具备persistent的能力，CTA数量不随任务量增大而增大
+//    从而实现tile级别的persistent。
+//
+// 补充：1）CTA==block，经常混用，二者描述的物理实体完全相同，只是语境不同，block出现在runtime API，而CTA出现在PTX手册与架构白皮书。
+//      2）sm90的warp specialize多采用PersistentTileSchedulerSm90充当tile scheduler？？
 
 // Persistent Thread Block (TB) scheduler
 class PersistentTileSchedulerSm90:
