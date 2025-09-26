@@ -399,6 +399,18 @@ is_input_fp8() {
           (cute::is_same_v<ElementB, float_e4m3_t> || cute::is_same_v<ElementB, float_e5m2_t>));
 }
 
+// <NT> is_use_rmem_A 是否把 A 矩阵放进rf的编译器决策函数，用于 CollectiveBuilder 
+// 选择 rs 还是 ss 的 CollectiveMma (如sm90的sm90_mma_tma_gmma_rs_warpspecialized.hpp / sm90_mma_tma_gmma_ss_warpspecialized.hpp)
+// 决策因素：
+//  1) IsABDifferentWidth:	A、B 位宽不一样（如 FP16 vs FP8）	位宽不同 -> 寄存器切分难度大 -> 优先用 RMEM 缓存 A
+//  2) HasScales:	A 或 B 带有 scale 因子（tuple）	scale 需额外寄存器 -> 干脆把 A 放 RMEM，省 SMEM 带宽
+//  3) IsInputSizeTwoBytes:	A、B 都是 16-bit（FP16/BF16）	16-bit 本身带宽低 -> 不急着用 RMEM
+//  4) IsLayoutAkBk:	A、B 都是 K-major（行主序）	K-major 访存连续 -> SMEM 带宽已够 -> 不用 RMEM
+//
+// SFINAE："Substitution Failure Is Not An Error" 的缩写，中文常叫 “替换失败不是错误”。
+//   它是 C++ 模板元编程 里的一条核心规则，让编译器在“重载决议”阶段遇到“替换失败”时，
+//   不把这种失败当成编译错误，而是简单地“把这个模板候选踢掉”，继续尝试别的重载
+
 // We need to handle the tuples in this function since it is used in SFINAE dispatch in the CollectiveBuilder.
 // At that point, it is not guaranteed that the tuples have been split out into the required parts.
 template <class MaybeTupleElementA, class MaybePairLayoutA, class MaybeTupleElementB, class MaybePairLayoutB>

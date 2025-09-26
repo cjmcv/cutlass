@@ -48,9 +48,67 @@
 
 #include "cute/tensor.hpp"
 #include "cutlass/arch/grid_dependency_control.h"
+#  define ENABLE_SM90_KERNEL_LEVEL 1
 
 ///////////////////////////////////////////////////////////////////////////////
+// <NT> GemmUniversal 的 KernelTmaWarpSpecializedPingpong 类型的偏特化实现。
+//   sm90中使用tma的kernel有4类：KernelTmaWarpSpecializedPingpong / KernelTmaWarpSpecializedCooperative / KernelTmaWarpSpecialized / KernelTma.
+// 以Pingpong和Cooperative两类warpspecialize的kernel最为常用。
+// 
+// pingpong是什么意思：TODO-没理清，继续梳理?
+// -- 在 SM90 的语境里，“ping-pong” 不是指传统 GPU 里“double-buffer 异步拷贝”，而是 Hopper TMA bulk-load 针对单 warp 的“单接口-双 slot”硬件级乒乓：
+// 同一 ProducerWarp 在 同一时钟周期只能挂 1 个 expect-tx；软件把 shared memory 切成 2 个 slot（A/B），轮流 给 偶/奇 tile 使用；
+// expect-tx + bulk.load 完成 后 立即翻转 slot 指针，无需等待下一深度 barrier，形成 “写 A→读 B→写 A→读 B…” 的 硬件原生乒乓，深度永远 =1，靠 Length=2 顺序屏障保序。
+// 一句话，这里的 ping-pong = “单深度-双槽-交替期望”，目的是绕过 TMA 单 expect-tx 限制，用最小 barrier 表实现零气泡搬运。
+//
+// expect-tx: 就是“写给 TMA 的收货单”：等多少字节全部到齐，barrier 才翻完成位——写少了提前唤醒，写多了永远睡死。
 
+// <NT>M warpspecialize 介绍
+// 定义：把一整张 GEMM 的流水线拆成几类专职 warp（group），让它们各自只盯一个子阶段、长期不换岗。
+// 好处：1) 寄存器利用率：
+//        传统的写法中，每个线程都需要负责读写和计算，都需要寄存器，甚至需要做double buffer等多缓冲区，寄存器压力大。
+//        Warp-specialized 把 warp 分成 Producer、Consumer、Epilogue 三类，Producer 只用 smem + 少量地址寄存器，Consumer 只用 累加寄存器，Epilogue 只需要写回寄存器。
+//      三类warp不会同时出现（barrier时序互斥），寄存器互不重叠。因为在同一个 warp-specialized CTA 内部，Producer warp 产生的数据（shared memory 中的 tile）只会被
+//      该 CTA 内部的 Consumer warp 消费。不会、也绝不能被其他 CTA 的 Consumer warp 访问。一个stage的时间线如下：
+//        | 周期区间   | 谁发指令                                   | 其余 warp 在干嘛                         | SM 资源视图                             |
+//        | --------- | ------------------------------------------ | --------------------------------------- | --------------------------------------- |
+//        | 0 … T0    | **Producer warp** 发 `cp.async`/`tma.load` | Consumer warp **停在 `barrier0.wait()`** | **所有 warp 的寄存器槽、SMEM 块都已分配** |
+//        | T0+1 … T1 | **Consumer warp** 发 `mma.sync`            | Producer warp **停在 `barrier1.wait()`** | 同上，资源未释放                         |
+//        | T1+2 … T2 | **Epilogue warp** 发 `st.global`           | 前两组都在等下一屏障                      | 同上                                    |
+//      以4个stage为例（有几个stage，其资源就要分配几份，互不干扰，注意寄存器是复用的前一个stage的，不需要分多份）：
+//        | 周期 | Producer warp 在干嘛      | Consumer warp 在干嘛    | 说明                                 |
+//        | -- | -------------------------- | ----------------------- | ------------------------------------ |
+//        | 0  | **stage-0 TMA load**       | `barrier0.wait()`       | 首次，Consumer 堵门                    |
+//        | 1  | **stage-1 TMA load**       | **stage-0 mma.compute** | **Producer-Consumer 第一次重叠**       |
+//        | 2  | **stage-2 TMA load**       | **stage-1 mma.compute** | 流水线已建立                           |
+//        | 3  | **stage-3 TMA load**       | **stage-2 mma.compute** | 同上                                   |
+//        | 4  | **stage-0 下一轮 TMA load** | **stage-3 mma.compute** | Producer **提前为下一条 k-loop 搬数据** |
+//      指令发出的顺序是：stage-0 load -> stage-1 load -> stage-0 mma -> stage-2 load -> stage-1 mma，指令的发射完全串行的！！！所以三类warp不会同时存在。
+//    而指令发射到操作完成有一定流水线延迟，如TMA/load 从发射到数据落进 shared memory 要 数百周期；mma 从发射到累加结果写回寄存器要 数十周期；
+//    基于这段时间差完成load和mma的overlap。
+//      另外Hopper 的 register file 是按 warp 槽位静态划分的（每个warp固定256寄存器）。只要一条 warp 的线程没有发射指令，它的整槽 256 个寄存器就不会被读/写，功耗和带宽都被门控掉——等价于“不存在”。 
+//    所以三类warp不同时存在（在任何一个时钟周期，只有一类角色（Producer / Consumer / Epilogue）的 warp 处于 Ready/Active 状态并发射指令；
+//    其余两类被 barrier 堵住，不发指令、不占寄存器读写带宽）的条件下，峰值寄存器用量 = max(P, C, E) × 256 寄存器/warp。
+//      另外寄存器压力小，则 tile 可以更大，如把 tile 尺寸从 128×128 拉到 256×256 后，同样大小的矩阵乘法只需要 1/4 个 CTA 就能盖住整个输出矩阵；
+//    CTA 数少了，launch 次数、grid-level 边界处理、L2 流量碎片都同步缩小。
+//
+//     2）TensorCore利用率：Consumer-warp 独占式发射 mma.sync，无 RAW 气泡、无地址计算穿插。传统 warp-uniform 因 地址/加载指令插入 mma 序列，通常只能到 70–80%。
+//     3）指令缓存 & 分支 零压力：每个warp只编译 一段直线代码（搬/算/写），无 runtime 分支、无函数指针、无动态调度器，I-Cache miss 率 < 0.1%；
+//            对比传统 kernel 里 “每个线程既做加载又做 mma”，导致 ICache 抖动明显下降。
+//     4）完全隐藏 Epilogue 写回延迟：sm80中通过multistage可以重叠load和mma，warpspecialize也有这一层含义，关于这点二者收益相似。
+//            而sm80的epi在mainloop之后，所有 warp 一起进入 store 阶段。此时 mainloop 已结束，没有后续计算可掩盖epi，使epi时延完全暴露。
+//            但是在warpspecialize下，仅仅是错后一个stage，Consumer-A 算下一块时，Consumer-B 写上一块，mainloop 永不停，可以掩盖epi。
+//
+// <NT> 为什么sm80不使用warp specialize
+// 1）没有TMA: SM80 只有 cp.async 线程级异步拷贝，每个 warp 都要自己算地址、发指令 ,Producer-warps 的指令流仍然挤占 ICache 与发射带宽；
+//            SM90 的 TMA 是 SM 级 DMA，一个线程一条指令就把多维 tile 搬完，Producer-warps 代码量骤减 80%，才能真正“轻载”.
+// 2）没有WGMMA：SM80 的 mma.sync 是 warp 内同步，每个warp自己算地址、自己发 ldmatrix/ld.shared 加载，再自己发 mma 计算，所以Consumer-warps 也无法做到“纯计算”；
+//              SM90 的 wgmma.mma_async，由 Producer-warps（或 TMA）提前把数据搬进 shared memory，Consumer-warps 只发“纯计算”指令 wgmma.mma_async，
+//            地址段已由硬件/TMA 隐式完成，计算段可异步继续；因此 Consumer-warps 的指令流里几乎只剩“纯计算”。
+//              总之：一个是sync，一个是async。sync的需要自己来处理，没有很好的同步途径；而async的可以由他人帮忙搬数据，自己负责计算即可。SM90 的 async 让“加载-计算”首次在 指令级 解耦。
+// 3）无 mbarrier + ordered sequence barrier：M80 只有 CTA 级 __syncthreads() 或 warp-vote 小把戏，想做“warp 级角色同步”得自己拼标志位，开销大且易翻车；
+//              SM90 提供 SM 级 mbarrier 与 ordered sequence barrier，一条指令就完成“搬完→算→写完”跨角色同步，零分支零投票。
+//
 namespace cutlass::gemm::kernel {
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -368,6 +426,16 @@ public:
     static_assert(cute::rank(StrideC{}) == 3, "StrideC must be rank-3: [M, N, L]. If batch mode is not needed, set L stride to Int<0>.");
     static_assert(cute::rank(StrideD{}) == 3, "StrideD must be rank-3: [M, N, L]. If batch mode is not needed, set L stride to Int<0>.");
 
+    // <NT> * WarpGroupRole 在这里是Producer/Consumer0/Consumer1，所以生产者和消费者的warp group比例是1:2.(注意是warp group而非warp)
+    //      * ProducerWarpRole 一个warp group里的warp会进一步分工，里面NumWarpsPerWarpGroup 固定为4 (见include/cutlass/cutlass.h)
+    //    所以 warp_idx_in_warp_group 会有0-3，则每一个warp group里的4个warp会分别负责 Mainloop/Warp1/Epilogue/MainloopAux 
+    //    每个算法实现里warp组里warp的分工都不一定相同，其中MainloopAux不一定需要(由IsMainloopAuxiliaryLoadNeeded判断)，
+    //    当不需要Aux时，第4个warp就会没有工作量，将不会占用sm，但空的warp也会占用Warp Slots，可能会有轻微性能影响。
+    //    ProducerWarp里会分，而ConsumerWarp则不分。
+    //      * shared_storage指向共享内存，由kernel外的device层级申请，此处kernel内使用。
+    //      * lane_predicate 为true时表示在一个warp里被选取出来充当代表的一个线程，其他31个线程将会是false。
+    //    如启动tma描述器只需要一个warp中的一个线程进行即可。
+
     enum class WarpGroupRole {
       Producer = 0,
       Consumer0 = 1,
@@ -399,7 +467,35 @@ public:
       CollectiveEpilogue::prefetch_tma_descriptors(params.epilogue);
     }
 
-
+    // <NT> 
+    // 1) TileScheduler 双流水线：任务领取 + 节流阀，见include/cutlass/gemm/kernel/sm90_tile_scheduler.hpp。
+    //      TileSchedulerPipeline 负责 “任务领取”——让 persistent 线程块安全地拿下一个 tile；（sm90的为PipelineEmpty）
+    //      TileSchedulerThrottlePipeline 负责 “流量整形”——限制 producer 查询频率，防止 少数 CTA 狂拿任务 导致 负载倾斜。（sm90的为PipelineEmpty）
+    //    IsSchedDynamicPersistent：sm90的kernel搭配的TileScheduler均设置为false。
+    // 2) 实例化 epilogue 对象，询问是否需要 epilogue-load（C 矩阵预取）；
+    // 3) 三条 TMA 流水线，Pipeline类型见 include/cutlass/pipeline/sm90_pipeline.hpp
+    //       MainloopPipeline (PipelineTmaAsync类型，如gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized.hpp)
+    //       -> is_leader 为整个warp group中第0号线程
+    //       -> num_consumers 为整个warp group的线程数量
+    //       -> num_producers 由mainloop给出，通常为1，见NumProducerThreadEvents: include/cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp
+    //       EpiLoadPipeline (PipelineTransactionAsync类型，如epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp)
+    //       -> 负责 把 global 里的 C/D 矩阵或 bias/scale 载入 smem，供 epilogue 计算单元使用。常常需要 1->N 广播（一个 tile 被 cluster 里多个 CTA 共享）。
+    //          必须知道 最后一个消费者 也 arrive 了，才能复用该 pipeline slot -> 需要 arrival-count -> 选 PipelineTransactionAsync<Stages>。
+    //       EpiStorePipeline (PipelineTmaStore类型，如epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp)
+    //       -> 负责 把算好的结果从 smem 写回 global（C/D 或 O 矩阵）。每个 tile 只写一次，写完即作废；无消费者。
+    //       -> 只要 TMA store 完成（scoreboard 位翻起）就能回收slot -> 不需要arrival计数 -> 选 PipelineTmaStore<Stages>（内部仅一条 bulk.commit + bulk.wait）。
+    // 4) 两个 OrderedSequenceBarrier (pipeline/sm90_pipeline.hpp):
+    //      load_order_barrier:  在producer mainloop中arrive，在producer epi中wait。为单缓冲 + 双生产者交替的最简顺序锁，即深度为1 长度为2。
+    //          1) 因为由硬件条件约束，TMA bulk-load 一次只能发一个expect-tx (Hopper)，如果 Depth > 1，
+    //          ProducerWarp 必须在同一 warp 内给两行 barrier 同时 expect-tx，硬件会丢包或返回错误，所以深度只能设置为1.
+    //          2) producer有 mainloop读取 和 epi读取 两个，mainloop在前，epi在后，有两级顺序关系，所以长度为2.
+    //      math_wg_order_barrier: 深度为2 (即stage总数)，长度为2. 在consumer中有两对wait/arrive。
+    //          1）消费者需要真正的“双缓冲段间重叠” 来 掩盖 compute 延迟，ProducerWarp 才需要 expect-tx， ConsumerWarp 只做 compute + arrive/wait，
+    //       完全不碰 expect-tx，因此ConsumerWarp的barrier行数(深度)可大于1。
+    //          2）compute 比 load 慢，若消费者也 深度为1，compute 阶段会堵住 load 阶段，导致气泡 2-3 ?s；因此 消费者必须 Depth=2（或 3） 才能 让 load 与 compute完全重叠。
+    //       这里深度是设置为2，也可以看到下面 消费者操作 里，有两对的wait/arrive，对应两个深度。
+    //          3）consumer也有 mma计算 和 epi写回 两个，mma计算 在前，epi写回在后，有两级顺序关系，所以长度为2.
+    //
     // TileScheduler pipeline
     typename TileSchedulerPipeline::Params scheduler_pipeline_params;
     typename TileSchedulerThrottlePipeline::Params scheduler_throttle_pipeline_params;
@@ -504,6 +600,10 @@ public:
     PipelineState epi_load_pipe_producer_state = cutlass::make_producer_start_state<EpiLoadPipeline>();
     PipelineState epi_store_pipe_producer_state = cutlass::make_producer_start_state<EpiStorePipeline>();
 
+    // <NT> 
+    // 1) cluster_wait_fn: Cluster 级同步, >1 CTA 时用 cluster-arrive/cluster-wait，否则普通 __syncthreads
+    // 2）problem_shape_MNKL: 把 3-D MNK 补成 4-D MNKL，方便统一处理 batch 维
+    // 3) load_inputs：初始化 scheduler、主循环、输入张量切块
     auto cluster_wait_fn = [&] () {
       // We need this to guarantee that the Pipeline init is visible
       // To all producers and consumer thread blocks in the Cluster
@@ -566,6 +666,46 @@ public:
     // Wait for all thread blocks in the Cluster
     cluster_wait_fn();
 
+    // <NT> Producer 和 Consumer 的工作概览
+    // Producer Warp Group:
+    //    * 使用 warpgroup_reg_dealloc<LoadRegisterRequirement> 按加载所需，当前 warp-group 的可用寄存器上限往下调，
+    //      让 SM 可以把腾出来的寄存器重新分配给其它 warpgroup/CTA。
+    //    1) ProducerWarpRole::Warp1：
+    //        * Scheduler 子 Warp，负责领取新任务。（由IsSchedDynamicPersistent包装，sm90不启用）。
+    //    2）ProducerWarpRole::Mainloop：TMA 搬 A/B
+    //        * while (work_tile_info.is_valid()) {  // 循环加载所负责的所有块
+    //            collective_mainloop.load(mainloop_pipeline, mainloop_pipe_producer_state)       ...
+    //            第一个tile加载完成时，调用 load_order_barrier.arrive(); 告知 epilogue load(Producer) warp 可以开始了
+    //            scheduler.advance_to_next_work()
+    //            work_tile_info = scheduler.get_current_work();
+    //          }
+    //          collective_mainloop.load_tail()
+    //    3）ProducerWarpRole::MainloopAux：（可选）
+    //    4）ProducerWarpRole::Epilogue：TMA 搬 C
+    //        * while (work_tile_info.is_valid()) {
+    //            首次进入，等待Mainloop的第一个tile完成加载 load_order_barrier.wait();
+    //            collective_epilogue.load(epi_load_pipeline, epi_load_pipe_producer_state)
+    //            scheduler.advance_to_next_work();
+    //            work_tile_info = scheduler.get_current_work();
+    //          }
+    //          collective_epilogue.load_tail();
+    //        * 因为scheduler是每个warp都有一份，所以循环获取tile可以用相同的scheduler，每个warp各自从头到尾遍历。
+    // Consumer Warp Groups：包含 Consumer0 与 Consumer1
+    //    * 使用 warpgroup_reg_alloc<MmaRegisterRequirement> 按mma所需，将可用寄存器上限调高
+    //    * while (work_tile_info.is_valid()) {
+    //        math_wg_order_barrier.wait();
+    //        collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state);
+    //        math_wg_order_barrier.arrive();
+    //        collective_mainloop.mma_tail();
+    //
+    //        math_wg_order_barrier.wait();
+    //        collective_epilogue.store(epi_load_pipeline, epi_load_pipe_consumer_state)
+    //        collective_epilogue.store_tail()
+    //        math_wg_order_barrier.arrive();
+    //
+    //        scheduler.advance_to_next_work(NumMmaWarpGroups);
+    //        work_tile_info = scheduler.get_current_work();
+    //      }
     if (warp_group_role == WarpGroupRole::Producer) {
       cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
     

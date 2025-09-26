@@ -28,7 +28,34 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
- 
+// <NT> GDC 介绍
+// 特性：GDC 允许在 GPU 上直接启动带有依赖关系的多个 kernel（grid），并让它等待另一个 kernel（grid）完成，从而实现 device-side 的 kernel 链式执行。
+// 原因：
+//   在传统 CUDA 中，kernel 启动后，grid 之间无法同步。如果你想让 kernel B 在 kernel A 完成后执行，只能回到主机（CPU），
+// 用 cudaDeviceSynchronize() 或 stream 依赖，再启动 kernel B。
+//   而 GDC 让你可以在 device 端直接启动 kernel B，并声明它依赖于 kernel A，无需返回主机，减少延迟，提升性能。支持构建复杂的 
+// device-side 执行图（类似 CUDA Graph，但在 device 端）。
+//
+// 关键函数: launch_dependent_grids / wait_on_dependent_grids
+//     __global__ void kernel_A(float* buf) {
+//       /* ... 生产数据 ... */
+//       cutlass::launch_dependent_grids();          // 声明：A 可作为前置
+//     }
+//     __global__ void kernel_B(float* buf) {
+//       cutlass::wait_on_dependent_grids();         // 1. 等 A 退休
+//       /* ... 消费 A，生产新数据 ... */
+//       cutlass::launch_dependent_grids();          // 2. 把 B 自己也登记为前置
+//     }
+//     __global__ void kernel_C(float* buf) {
+//       cutlass::wait_on_dependent_grids();         // 等 B 退休
+//       /* ... 消费 B ... */
+//     }
+//     // 主机侧（一次性打开 GDC）
+//     cudaSetDeviceFlags(cudaDeviceGridDependencyControl);
+//     kernel_A<<<..., stream>>>(d);
+//     kernel_B<<<..., stream>>>(d);
+//     kernel_C<<<..., stream>>>(d);
+
 /*! \file
     \brief Grid dependent control (GDC) helpers for programmatic dependent launches (PDL).
 */

@@ -28,7 +28,50 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-#pragma once
+// <NT> Cluster 线程块集群 介绍
+// Cluster是sm90后提出的概念，将原来的四级模型 thread → warp → CTA → grid，
+// 扩展为五级：thread → warp → CTA → cluster → grid，并为此在指令集、存储器系统和调度器上都做了配套设计。
+// 1) 一个cluster是1-16个CTA的硬件绑定体（H20最多8个，H100最多16个，可由ClusterShape来指定），
+//    一次性被派发/占满同一个 GPC 内的若干 SM (H20有8个，H100有16个)
+// 2）cluster 是软件/编程模型层面的抽象，GPC 是硬件实体；
+//    多个 cluster（甚至来自不同 kernel）可以被依次或并发地派发到同一个 GPC 上，只要该 GPC 里还有足够空闲 SM 即可。
+//    cluster 保证“我这N个CTA必落同一 GPC”，但GPC并不独占给某个cluster；SM资源用完就换下一批，灵活复用。
+// 3）一个cluster内的多个cta 可以把彼此的 shared memory 当作一块‘跨核的分布式共享内存’来直接读写，即 DSM (Distributed Shared Memory)。
+//    每块 SM 仍然有自己的 256 kB Shared Memory，在 GPC 内部新增了一条高速交叉开关（crossbar），把同 GPC 里所有 SM 的 SMEM 端口连在一起。
+//    A-SM 的 CUDA 线程可以通过这条 crossbar 直接访问 B-SM 的 SMEM，延迟 ≈ 40 cycles，带宽接近 L1。
+//
+// gemm实现上体现出来的好处 (sm90后，cluster都会是默认调度单元)：
+// 1）在cluster可支持TMA广播，见下面的TMA multicast介绍，减少gmem的读取。
+// 2）split-k/stream-k的global reduction：在传统写法中，每个CTA都需要将自己的k段结果写回到gmem，然后再基于gmem将k段凑齐得到最终结果。
+//   在cluster下，一个cluster有多个cta，里面的k段结果在cluster内可以通过DSM直接完成规约，不再需要写gmem。
+//   只有当k段被拆分到多个cluster时，跨cluster的部分才需要经过gmem进行汇总。大大减少了gmem的读写次数。
+// 3）小矩阵下，基于cluster能把使用率打满，而sm80的不行，尽管使用了stream-k。
+//     一个 wave = 同时能被 GPU 接纳并启动的最大 CTA 数量（≤ SM 数），在sm80下，只要剩余CTA数≥SM数，driver就可以一次把整波(full wave)推下去,
+//   但是对于尾波(tail wave)，即剩余cta数小于sm数时，硬件驱动层面上不存在“partial wave”原子派发机制，即不存在“同一时钟周期一起发射”这种硬件机制，
+//   所以只能一个一个CTA地零星派发、零星结束，先发的那几个 CTA 可能都跑完了，后面的还没落地，空窗期叠加后把平均 occupancy 拉垮。
+//     而基于cluster下，如cluste包含8个cta，则tail wave的原子则是8个cta 8个cta地派发，虽没有wave的打包粒度大，但也比单个CTA要大很多。
+// 4）寄存器压力变小：1. sm80中每个线程既加载又计算，所以既要地址寄存器，又要累加寄存器；而sm90的ws下，单线程只干一件事，所以寄存器需要变小。
+//                  2. sm80中无TMA，先 ld.global→SMEM→REG，REG 必须整 tile 缓存；而sm90中TMA 直接 async-fence→SMEM，consumer warp 逐条吸入 REG；占用时间短。
+//
+// 概念补充：
+// 1）GPC (Graphics Processing Cluster), 用于把多个 SM 与固定功能单元打包成可独立工作的“子芯片”。
+//    早在kepler时代就有，但在hopper上首次给 GPC 内部加了专门的交叉互连网络，让同一个GPC内的所有SM
+//    可以直接访问彼此的 shared memory，从而支撑起 thread-block cluster 这一新编程抽象。
+//    * GPC的硬件位置：thread最小执行单元 -> warp为32个线程 -> cta/block 为多个warp -> sm 为硬件上执行 CTA 的单元
+//                   -> GPU 包含多个 SM 和固定功能单元 -> GPU 芯片 包含多个GPC
+//    * cluster 必须完全落在一个 GPC 内，因此 GPC 大小直接决定 cluster 的 CTA 上限。
+// 2) cluster-barrier：cluster内多个block同步，纯寄存器级握手（Hopper新加CLUSTER_ARV,CLUSTER_WAIT指令）
+//        每个 SM 只在自己核心里 写 1 个 bit 寄存器 → 硬件广播网收集 → 一旦“bit 数=CTA 数”就同时放行。
+//        全程不走 SRAM/DRAM，距离是“隔壁核心”，几十 cycles 搞定。
+//    * __syncthread(): 是cta内同步，硬件实现是 SMEM 的 bank arbiter 计数：每个 warp 把计数器写到
+//        SMEM → 仲裁逻辑轮询 → 直到“到达数=总 warp 数” → 再广播放行
+// 3) TMA multicast：Hopper 架构给 cluster 新增的 硬件级“一写多读” 能力只用一次 TMA load，
+//   就能把同一块 GMEM 数据同时搬进 cluster 内所有 CTA 的 SMEM，省去重复流量、保证 L2 命中。
+//    如 4 个 CTA 需要同一份 A 子矩阵，按以往的做法需要每个CTA各自 ld.global -> SMEM，即4份流量、4份L2查询、可能4份miss。
+//   而用TMA multicast可以一次加载广播到1~16个目标smem上。
+// 4) cluster其他笔记： include/cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp
+
+ #pragma once
 
 #include <cute/config.hpp>
 #include <cute/numeric/numeric_types.hpp>
@@ -150,6 +193,7 @@ CUTE_DEVICE dim3 cluster_shape()
 #endif
 }
 
+// <NT> 获得一个cluster中的cta id号。
 // Get 1D ctaid in a cluster.
 CUTE_DEVICE uint32_t block_rank_in_cluster()
 {

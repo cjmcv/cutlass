@@ -48,10 +48,12 @@
 #include "cutlass/arch/grid_dependency_control.h"
 
 ///////////////////////////////////////////////////////////////////////////////
+// <NT> GemmUniversal的KernelTmaWarpSpecializedCooperative类型的偏特化实现。
+// 核心函数是 operator()，为计算的主流程。
+// 
 
 namespace cutlass::gemm::kernel {
 
-// <NT> 偏特化的 GemmUniversal，对应 gemm_universal.h
 template <
   class ProblemShape_,
   class CollectiveMainloop_,
@@ -374,13 +376,6 @@ public:
       MainloopAux = 3
     };
 
-
-    // <NT> NumWarpsPerWarpGroup固定为4 (见include/cutlass/cutlass.h)
-    // 所以warp_idx_in_warp_group会有0-3，则每一个warp group里的4个warp会分别负责 Mainloop/Warp1/Epilogue/MainloopAux 
-    // 每个算法实现里warp组里warp的分工都不一定相同，其中MainloopAux不一定需要(由IsMainloopAuxiliaryLoadNeeded判断)，
-    // 当不需要Aux时，第4个warp就会没有工作量，将不会占用sm，但空的warp也会占用Warp Slots，可能会有轻微性能影响。
-    //   WarpGroupRole在这里是Producer/Consumer0/Consumer1，所以生产者和消费者的warp group比例是1:2.
-    
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
@@ -498,7 +493,6 @@ public:
     PipelineState mainloop_pipe_producer_state = cutlass::make_producer_start_state<MainloopPipeline>();
     PipelineState epi_load_pipe_producer_state = cutlass::make_producer_start_state<EpiLoadPipeline>();
     PipelineState epi_store_pipe_producer_state = cutlass::make_producer_start_state<EpiStorePipeline>();
-
 
     auto cluster_wait_fn = [] () {
       // We need this to guarantee that the Pipeline init is visible

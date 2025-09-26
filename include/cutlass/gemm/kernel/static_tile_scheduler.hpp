@@ -41,7 +41,28 @@
 namespace cutlass::gemm::kernel::detail {
 
 ///////////////////////////////////////////////////////////////////////////////
-
+// <NT> StaticPersistentTileScheduler 介绍
+// static persistent tile scheduler的基类，目前有 PersistentTileSchedulerSm90 和 StaticPersistentTileScheduler100 两个派生类。
+// 特点：编译期静态分块 + 持久线程块：
+//     1) 在 kernel 启动前就把整个问题空间切成固定大小的 tile，并一次性算出每个 tile 的全局线性索引 -- 静态
+//     2) CTA/WarpGroup 启动后自取一个线性序号，再映射成 tile(M,N,L)，干完再取下一块，做轮询自取，直到直到把所有 tile 干完就退出 -- 持久
+//     3）不 split 输出 tile，不做 reduction fixup，因此不需要软件 pipeline
+//     总之：tile 顺序提前算好，CTA 自取自营，无阶段、无队列、无 pipeline，靠大量常驻 warps 自然掩蔽延迟，所以代码最轻、寄存器最省。
+//
+// 使用例子：
+//   using Scheduler = StaticPersistentTileScheduler<MyConfig>;
+//   __global__ void gemm_kernel(...) {
+//     extern char smem_buf[];
+//     typename Scheduler::Params params = *params_ptr;
+//     Scheduler scheduler(params);               // 1. 构造
+//     auto work = scheduler.initial_work_tile_info();
+//     while (work.is_valid()) {                  // 2. 自取循环
+//       compute_tile(work, smem_buf);            // 3. 算整块 tile
+//       work = scheduler.fetch_next_work(work)   // 4. 取下一块
+//              .get<0>();
+//     }
+//   }
+ 
 // Users are not supposed to use this class directly.
 // This is a CRTP base class for the actual tile schedulers.
 template<class Subclass>

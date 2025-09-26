@@ -43,9 +43,16 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/detail/dependent_false.hpp"
 
-// <NT> pipeline导读
-// sm90的pipeline主要有PipelineTmaAsync和PipelineAsync，用于数据在生产者(load)和消费者(mma)之间搬运流通，
-// 分别对应使用tma和使用普通的cp.async, 两个类型都带有Stages_参数，可分多阶流水处理，高效重叠数据加载和计算。
+// <NT>M pipeline导读
+// sm90的pipeline类型有以下4种，均按stage划分：
+// | Pipeline                 | 方向 | multicast | arrive 计数| 底层指令                         | 典型场景             | 内部 barrier          |
+// | ------------------------ | ---- | --------- | --------- | -------------------------------- | ------------------- | -------------------- |
+// | PipelineTmaAsync         | g->s | N         | N         | bulk + mbarrier.wait             | A/B 矩阵常规 load    | 仅 done_bits         |
+// | PipelineTmaStore         | s->g | N         | N         | bulk.store + wait                | 写回 C/D/O           | 仅 done_bits         |
+// | PipelineTransactionAsync | g->s | Y         | Y         | bulk + ClusterTransactionBarrier | KVcache广播/epi读bias | full/empty 双 barrier |
+// | PipelinePipelineAsync    | g->s | N         | N         | cp.async.line + wait_group      | fallback/不规则访问    | transaction 计数     |
+
+// 分别对应使用tma的bulk和使用普通的cp.async, 两个类型都带有Stages_参数，可分多阶流水处理，高效重叠数据加载和计算。
 // 消费者需要判断数据是否准备好，生产者需要判断消费者数据是否使用完成，底层会通过barrier来完成。
 // 
 // api分两类：
@@ -62,7 +69,33 @@
 //  5）transaction_bytes: 一次tma传输涉及到的字节数
 //  6）initializing_warp: 常用默认值0，即使用0号warp作为代表去做初始化
 // barrier类型：见 include/cutlass/arch/barrier.h
-//  1）ClusterTransactionBarrier / ClusterBarrier 
+//  1) ClusterTransactionBarrier / ClusterBarrier 
+//
+//
+// <NT> OrderedSequenceBarrier 有序序列屏障介绍
+//   为 SM90+ 流水线设计，同一 stage 内按固定顺序 N→0→1→2→…→N-1→0 依次 arrive/wait，保证 producer i 永远先于 producer i+1 离开当前 stage，
+// 从而消除乱序竞争、简化指针切换逻辑。 
+//   SequenceDepth_: pipeline 深度（双缓冲/三缓冲段数）,对应着stage总数
+//   SequenceLength_: 同一深度内有序接力的小组数（例如 cluster 里有 4 个 CTA 负责不同 head） 
+//   
+// 用例：
+//   for (int stage = 0; stage < Depth; ++stage) {
+//     ordered_barrier.wait();          // 1. 等上一圈同组伙伴 arrive
+//     compute_or_copy();               // 2. 干活
+//     ordered_barrier.arrive();        // 3. 给下一组发 arrive，自带 ++stage_
+//   }
+//   wait() -> 对本组做 wait(phase)，保证前一周期同组已到达. barrier_ptr_[stage_.index() * Length + params.group_id]
+//   arrive() -> 对下一组做 arrive()，顺序固定，不会乱抢. barrier_ptr_[stage_.index() * Length + (group_id+1)%Length]
+//   stage_：PipelineState<Depth>，自带相位位，自动翻转相位进入下一深度，深度SequenceDepth_即是stage的总数。
+//
+// 深度Depth和长度Length可以理解为 Depth 行 × Length 列 的 二维屏障表，一行 = 一个 pipeline 段（stage），一列 = 一个 顺序小组（group）。
+// 同一行内：必须 按列号 0 → 1 → 2 → … → Length-1 依次 wait/arrive（顺序接力）。 一行全部列完成后，才整体推进到下一行（stage_++ 并取模 Depth）。
+// 循环往复，形成 “横向顺序、纵向循环” 的 二维保序流水线。
+//
+// 深度（Depth）	无依赖,	每行对应 不同缓冲段（A/B/C 段），数据地址独立,可并行
+// 长度（Length）	有顺序依赖,	同一段内 下一列要等上一列 arrive 才能开始, 必须顺序
+//
+// 使用时只用wait和arrive，如何对应到深度和长度？TODO?
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {

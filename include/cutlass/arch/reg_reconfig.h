@@ -60,6 +60,7 @@
 namespace cutlass {
 namespace arch {
 
+// <NT> kernel 运行到某个重计算热点之前，临时把当前 warp-group 的寄存器上限抬高. 与下面的warpgroup_reg_dealloc相反。
 template<uint32_t RegCount>
 CUTLASS_DEVICE
 void warpgroup_reg_alloc(){
@@ -68,6 +69,13 @@ void warpgroup_reg_alloc(){
 #endif
 }
 
+// <NT> 手动把当前 warp-group 的可用寄存器上限往下调，让 SM 可以把腾出来的寄存器文件（RF）
+// 立刻重新分配给其它 warpgroup/CTA，从而提高 occupancy 或者给需要更多寄存器的任务让路。
+// setmaxnreg： 运行时动态修改“每 warp-group 最大寄存器数”。
+// dec：表示“减少” (decrease)
+// sync.aligned – 全 warpgroup 同步后再执行，避免寄存器紧缩时有人还在用
+// u32 %0 – 立即数寄存器数，必须 8 的倍数，范围 24?256。
+// RegCount 模板参数 – 编译期常数，告诉编译器“我想把上限压到多少”
 template<uint32_t RegCount>
 CUTLASS_DEVICE
 void warpgroup_reg_dealloc(){

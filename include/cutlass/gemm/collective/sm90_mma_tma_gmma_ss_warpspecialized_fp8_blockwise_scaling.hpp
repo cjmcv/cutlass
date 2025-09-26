@@ -53,7 +53,7 @@ namespace cutlass::gemm::collective {
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// <NT> 参数分析
+// <NT> collective_mma 参数分析
 //  * ClusterShape: hopper架构提出了cluster smem（分布式共享内存，DSM）的概念，位于L1和L2 Cache之间新增了一层SM-to-SM网络，
 // 使得同一个Cluster内的SM可以访问其他SM的Shared Memory，从而打破了传统上不同Thread Block之间无法直接通信的限制。
 // cluster的组成单元是sm（cutlass编程定义会使用block），一个cluster通常会由2/4/8/16个sm组成，hopper多为2/4, 如Shape<_1,_2,_1>
