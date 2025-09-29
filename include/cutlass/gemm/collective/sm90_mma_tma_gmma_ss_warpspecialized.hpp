@@ -301,6 +301,42 @@ struct CollectiveMma<
     return cute::make_tuple(gA_mkl, gB_nkl);
   }
 
+  // <NT> MainloopSm90TmaGmmaWarpSpecialized的 load 函数介绍
+  // 流程： for ( ; k_tile_count > 0; --k_tile_count)
+  //          pipeline.producer_acquire
+  //          pipeline.producer_get_barrier
+  //          copy(mcast-a/b)
+  //
+  // multicast：
+  //  1) 把 1-D 的 block_rank_in_cluster 映射到 2-D (m, n) 网格
+  //     uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
+  //  2) 生成 A 矩阵 mask（行广播）：固定当前行号 cluster_local_block_id.x，遍历 所有列号 n，把同一行的所有 block_id 置 1。
+  //     形成 行广播掩码 一次 TMA load A 把同一份 A tile 同时写进该行所有 block 的 smem A buffer
+  //     for (int n = 0; n < size<1>(block_layout); ++n)
+  //       mcast_mask_a |= uint16_t(1) << block_layout(cluster_local_block_id.x, n, Int<0>{});
+  //  3）生成 B 矩阵 mask (列广播)：固定当前列号 cluster_local_block_id.y，遍历 所有行号 m，把同一列的所有 block_id 置 1。
+  //     形成 列广播掩码 一次 TMA load B 把同一份 B tile 写进 该列所有 block 的 smem B buffer
+  //     for (int m = 0; m < size<0>(block_layout); ++m)
+  //       mcast_mask_b |= uint16_t(1) << block_layout(m, cluster_local_block_id.y, Int<0>{});
+  //  4) 基于掩码进行拷贝
+  //     copy(mainloop_params.tma_load_a.with(*tma_barrier, mcast_mask_a), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+  //
+  //  * 掩码宽度 16 bit → 最多支持 16 个 block 的 Cluster，与 Hopper 硬件上限一致。
+  //  * multicast可以使一次TMA 让一个cluster里多个block(掩码置1的) 都同时拿到相同的数据。
+  //  对于A矩阵的读取, m相同的block可共享一份数据，对于B矩阵的读取，n相同的block可共享一份数据。
+  //  如: for (int m=0; m<M; m++) 
+  //        for (int n=0; n<N; n++) 
+  //          for (int k=0; k<K; k++) 
+  //            C[m,n] += A[m,k] * B[n,k]
+  //  对于一个cluster(2,2)内的4个block而言：
+  //    block(m  ,n  )负责C[m  ,n  ]的输出，循环读k，当k为0时，需要读取A[m,0]   / B[n,0]
+  //    block(m  ,n+1)负责C[m  ,n+1]的输出，循环读k，当k为0时，需要读取A[m,0]   / B[n+1,0]
+  //    block(m+1,n  )负责C[m+1,n  ]的输出，循环读k，当k为0时，需要读取A[m+1,0] / B[n,0]
+  //    block(m+1,n+1)负责C[m+1,n+1]的输出，循环读k，当k为0时，需要读取A[m+1,0] / B[n+1,0]
+  //  即A矩阵m相同则共享，B矩阵n相同则共享：
+  //    block(m  ,n  ), block(m  ,n+1)   =>    A[m,0]/B[n,0]  ,  A[m,0]/B[n+1,0]
+  //    block(m+1,n  ), block(m+1,n+1)   =>    A[m+1,0]/B[n,0],  A[m+1,0]/B[n+1,0]
+
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Producer Perspective
   template <
@@ -409,6 +445,25 @@ struct CollectiveMma<
     }
   }
 
+  // <NT> sm90 MainloopSm90TmaGmmaWarpSpecialized的mma函数介绍
+  // 1）类型检查：
+  // * FrgTensorC 计算结果需存放在寄存器，mma只管计算，不管写回
+  // * SmemLayoutA / SmemLayoutB 为三维(BLK_M, BLK_K, PIPE)/(BLK_N, BLK_K, PIPE)，PIPE=Stages实现双缓冲。
+  // * SmemCopyAtomA / SmemCopyAtomB 必须是 void。
+  //   因为sm90的 GMMA 指令本身就从 shared memory 直接读 A/B，不需要再经过寄存器中转。
+  //   而CopyAtom的含义中，当其不为void时，表示走 smem->reg->TensorCore 的路径；为void表示把smem提交给GMMA, 不经过reg。
+  // 2）构建smem的视图 sA / sB
+  // 3) WarpGroup 划分，以 线程号 / warpgroup内总线程数，换算得到当前线程对应的 warp_group_idx。
+  //    * __shfl_sync(0xFFFFFFFF, ..., 0)	0xFFFFFFFF是掩码，表示所有32线程都参与广播。
+  //    * 0 表示从 lane-0 广播这个值到整个 warp 的所有线程.
+  //    auto thread_mma = tiled_mma.get_slice(warp_group_layout(warp_group_idx));
+  //    每个 warp-group 只取自己那一 slice 的 A/B/C 子张量，互不重叠。
+  // 4）分配寄存器描述符 tCrA/tCrB (MMA, MMA_M, MMA_K, PIPE)。
+  // 5）检查pipeline变量：K_PIPE_MMAS 同时 inflight 的 GMMA 批次数量（通常 2-4），用来隐藏 GMMA latency。
+  //                     warpgroup_wait<K_PIPE_MMAS>() 保证 不会同时提交超过硬件上限。
+  // 6）Prologue与mainloop阶段：见下面的注释笔记 <NT>S
+  //
+
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
   template <
@@ -422,9 +477,11 @@ struct CollectiveMma<
       int thread_idx,
       TensorStorage& shared_tensors,
       Params const& mainloop_params) {
+
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
     static_assert(cute::rank(SmemLayoutA{}) == 3, "Smem layout must be rank 3.");
     static_assert(cute::rank(SmemLayoutB{}) == 3, "Smem layout must be rank 3.");
+
     static_assert(cute::is_void_v<SmemCopyAtomA>,
       "SM90 GMMA mainloops cannot have a non-void copy atom for smem sourced instructions.");
     static_assert(cute::is_void_v<SmemCopyAtomB>,
@@ -525,6 +582,26 @@ struct CollectiveMma<
     warpgroup_fence_operand(accum);
     // Mainloop GMMAs
     k_tile_count -= prologue_mma_count;
+
+    // <NT>S
+    //   mainloop阶段，直接进入steady-state 双缓冲：搬→算→搬→算…，每算完一 tile 就释放 smem 缓冲区；
+    //   前面的prologue 把前 K_PIPE_MMAS 个 tile 算完，让 DMA 提前填下一批。即把 pipeline“灌满”到预定水位，
+    // 让 TensorCore 和 TMA 搬运从第一拍就重叠；不释放缓冲区、不 wait GMMA，只为“预热”；mainloop 才带 
+    // wait + release，保持 inflight 数量恒定。
+    //
+    // Mainloop
+    // 1) pipeline.consumer_try_wait, 负责轻量级探针，只读一次 barrier 计数器/相位，立即返回，不调用arch::barrier_wait；
+    //       大多数情况下producer 早已 arrive，token 直接命中，省一次 heavy barrier 调用，如多个warp同时冲击barrier寄存器会撑爆 LSU (Load-Store Unit)
+    // 1) pipeline.consumer_wait(...)	根据 consumer_try_wait 返回结果里记录的“是否已满足” 决定路径.
+    //       如已满足，则立即返回，否则才真正阻塞等待。等到 DMA warp 把 A/B 搬进 smem，phase 翻转即继续。
+    // 3) warpgroup_fence_operand(accum)：表示在我真正要对 accum 寄存器做下一步操作（读、写、scale、store）之前，
+    //       先把所有已经发射的 WGMMA 指令完成，并确保累加结果对当前线程可见。
+    // 2) warpgroup_arrive()：向 TensorCore 发射 GMMA 描述符（非阻塞），表示当前 warp-group 的所有线程已经到达同一点，
+    //       可以开始发射下一批 WGMMA（TensorCore）指令了。
+    // 3) cute::gemm(...)	循环 K 维，一次提交 MMA_K 深度，其发射的wgmma指令，指令已进队列开始计算
+    // 4) warpgroup_commit_batch()：“关门”，把前面的wgmma归为一组，保证后续 wait 能等到这一整组。
+    // 5) warpgroup_wait<K_PIPE_MMAS>()	阻塞直到warpgroup_commit_batch提交的整组全部完成，保证 smem 缓冲区已空
+    // 6) pipeline.consumer_release(...)	通知 DMA warp “这个 smem 阶段我已用完”，可再填新数据
 
     CUTLASS_PRAGMA_NO_UNROLL
     for ( ; k_tile_count > 0; --k_tile_count)

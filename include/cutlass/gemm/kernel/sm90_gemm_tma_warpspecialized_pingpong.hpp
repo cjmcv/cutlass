@@ -55,14 +55,21 @@
 //   sm90中使用tma的kernel有4类：KernelTmaWarpSpecializedPingpong / KernelTmaWarpSpecializedCooperative / KernelTmaWarpSpecialized / KernelTma.
 // 以Pingpong和Cooperative两类warpspecialize的kernel最为常用。
 // 
-// pingpong是什么意思：TODO-没理清，继续梳理?
-// -- 在 SM90 的语境里，“ping-pong” 不是指传统 GPU 里“double-buffer 异步拷贝”，而是 Hopper TMA bulk-load 针对单 warp 的“单接口-双 slot”硬件级乒乓：
-// 同一 ProducerWarp 在 同一时钟周期只能挂 1 个 expect-tx；软件把 shared memory 切成 2 个 slot（A/B），轮流 给 偶/奇 tile 使用；
-// expect-tx + bulk.load 完成 后 立即翻转 slot 指针，无需等待下一深度 barrier，形成 “写 A→读 B→写 A→读 B…” 的 硬件原生乒乓，深度永远 =1，靠 Length=2 顺序屏障保序。
-// 一句话，这里的 ping-pong = “单深度-双槽-交替期望”，目的是绕过 TMA 单 expect-tx 限制，用最小 barrier 表实现零气泡搬运。
+// Pingpong    = 两个 Consumer-WG 轮流啃 同一组 pipeline stage（一个吃奇数槽，一个吃偶数槽）。靠 barrier.phase 翻转 实现严格WG 之间交替，WG 级互斥。
+//                 WG-0  Producer   : 一直发 TMA  
+//                 WG-1  Consumer-A : 专吃 stage 0,2,4…  
+//                 WG-2  Consumer-B : 专吃 stage 1,3,5…
+//               需要2× pipeline stage 的 shared memory + 2× 寄存器堆 给两个 WG 轮流用。
+// cooperative = 把“大块”再劈成“子块”，多组线程束一起上。同一块（甚至同一 WG）里的 4-8 组 warp 同时抢不同 k_tile 做 MMA，累加同一组输出寄存器。
+//               只要 1× 寄存器堆，把省下的寄存器拿来再塞 1-2 组 warp，原理上cooperative性能远优于pingpong。(不再需要MathWarpGroupOrderBarrier)
 //
-// expect-tx: 就是“写给 TMA 的收货单”：等多少字节全部到齐，barrier 才翻完成位——写少了提前唤醒，写多了永远睡死。
-
+// 问题：pingpong很多时候难以发挥cooperative的真实性能，大多以pingpong为主，cooperative为辅。而sm100以后则以cooperative为主，pingpong为辅。
+// 答：1）因为sm90一个 warp 每周期只能发 1 条 MMA，若把 K 切片给 4 组 warp 同时算，前端端口立刻挤爆。
+//        而SM100 的 double-issue 前端 + mma.sp 新指令，单周期可发 2 条 MMA，带宽够了，多组 warp 一起算才不会堵队。
+//     2) sm90 之前没有 sub-warpgroup 级 barrier，__mbarrier 最小同步单位是 32 线程 warp，如果 warp 数 > 硬件 barrier 槽位 就会 串行化，反而更慢。
+//        sm100 开始支持 thread-block-cluster + 更轻量 barrier。
+//     3）sm90寄存器太小，多个warp协作容易导致寄存器溢出。
+//
 // <NT>M warpspecialize 介绍
 // 定义：把一整张 GEMM 的流水线拆成几类专职 warp（group），让它们各自只盯一个子阶段、长期不换岗。
 // 好处：1) 寄存器利用率：
@@ -429,8 +436,10 @@ public:
     // <NT> * WarpGroupRole 在这里是Producer/Consumer0/Consumer1，所以生产者和消费者的warp group比例是1:2.(注意是warp group而非warp)
     //      * ProducerWarpRole 一个warp group里的warp会进一步分工，里面NumWarpsPerWarpGroup 固定为4 (见include/cutlass/cutlass.h)
     //    所以 warp_idx_in_warp_group 会有0-3，则每一个warp group里的4个warp会分别负责 Mainloop/Warp1/Epilogue/MainloopAux 
-    //    每个算法实现里warp组里warp的分工都不一定相同，其中MainloopAux不一定需要(由IsMainloopAuxiliaryLoadNeeded判断)，
-    //    当不需要Aux时，第4个warp就会没有工作量，将不会占用sm，但空的warp也会占用Warp Slots，可能会有轻微性能影响。
+    //    每个算法实现里warp组里warp的分工都不一定相同.
+    //        其中编号为3的MainloopAux不一定需要(由IsMainloopAuxiliaryLoadNeeded判断)，当不需要Aux时，第4个warp就会没有工作量，
+    //    将不会占用sm，但空的warp也会占用Warp Slots，可能会有轻微性能影响。
+    //        另外编号为1的Warp1会IsSchedDynamicPersistent所覆盖，而目前sm90的kernel，其值均为false，因此Warp1也不生效。
     //    ProducerWarp里会分，而ConsumerWarp则不分。
     //      * shared_storage指向共享内存，由kernel外的device层级申请，此处kernel内使用。
     //      * lane_predicate 为true时表示在一个warp里被选取出来充当代表的一个线程，其他31个线程将会是false。
@@ -496,6 +505,8 @@ public:
     //       这里深度是设置为2，也可以看到下面 消费者操作 里，有两对的wait/arrive，对应两个深度。
     //          3）consumer也有 mma计算 和 epi写回 两个，mma计算 在前，epi写回在后，有两级顺序关系，所以长度为2.
     //
+    // *expect-tx: 就是“写给 TMA 的收货单”：等多少字节全部到齐，barrier 才翻完成位——写少了提前唤醒，写多了永远睡死。
+
     // TileScheduler pipeline
     typename TileSchedulerPipeline::Params scheduler_pipeline_params;
     typename TileSchedulerThrottlePipeline::Params scheduler_throttle_pipeline_params;
@@ -699,7 +710,8 @@ public:
     //        collective_mainloop.mma_tail();
     //
     //        math_wg_order_barrier.wait();
-    //        collective_epilogue.store(epi_load_pipeline, epi_load_pipe_consumer_state)
+    //        collective_epilogue.store(epi_load_pipeline, epi_load_pipe_consumer_state，
+    //                                  epi_store_pipeline, epi_store_pipe_producer_state)
     //        collective_epilogue.store_tail()
     //        math_wg_order_barrier.arrive();
     //
