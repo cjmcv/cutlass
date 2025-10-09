@@ -560,8 +560,8 @@ public:
 
   // <NT> Sm90TmaWarpSpecialized 对应的 CollectiveEpilogue.store 函数介绍
   // 参数: 
-  //  1) load_pipeline: 调用 consumer_release/wait消耗load_pipeline的数据.
-  //  2) store_pipeline：调用 producer_commit/acquire 往store_pipeline生产数据.
+  //  1) load_pipeline: 调用 consumer_release/wait 消耗load_pipeline的数据.
+  //  2) store_pipeline: 调用 producer_commit/acquire 往store_pipeline生产数据.
   //  3) accumulators: mma tile的计算结果，每个线程持有一块，数据驻留在寄存器。
   //
   // 编译分支：
@@ -570,9 +570,9 @@ public:
   //  3) ReuseSmemC: 是否把 smem C buffer 就地复用为 D buffer.
   //
   // 步骤：
-  //  1) 切片：先拿到整个输出张量D的TMA视图 mD_mn。按CTA tile坐标切出本线程块要写的区域 gD。再按 EpilogueTile 拆成子块序列 gD_epi，每个子块对应一次 TMA bulk 事务。
+  //  1) 切片: 先拿到整个输出张量D的TMA视图 mD_mn。按CTA tile坐标切出本线程块要写的区域 gD。再按 EpilogueTile 拆成子块序列 gD_epi，每个子块对应一次 TMA bulk 事务。
   //          获取与之对应的smem区域, 并做swizzle得到 sD_epi, 可同时满足 MMA 写/读的对齐与 bank-conflict-free。
-  //  2) 建立TiledCopy：tiled_copy_C_atom / tiled_r2r / tiled_r2s / tiled_s2r
+  //  2) 建立TiledCopy: tiled_copy_C_atom / tiled_r2r / tiled_r2s / tiled_s2r
   //  3）融合回调(EVT)插入点: cst_callbacks = ... get_consumer_store_callbacks (实现: include/cutlass/epilogue/fusion/sm90_visitor_*.hpp)
   //     1. cst_callbacks.begin() – 全局前置（scale 广播、指针准备）
   //     For each tile:

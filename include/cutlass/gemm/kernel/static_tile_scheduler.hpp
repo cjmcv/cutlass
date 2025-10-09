@@ -49,7 +49,7 @@ namespace cutlass::gemm::kernel::detail {
 //     3）不 split 输出 tile，不做 reduction fixup，因此不需要软件 pipeline
 //     总之：tile 顺序提前算好，CTA 自取自营，无阶段、无队列、无 pipeline，靠大量常驻 warps 自然掩蔽延迟，所以代码最轻、寄存器最省。
 //
-// 使用例子：
+// 使用例子（基于fetch_next_work）：
 //   using Scheduler = StaticPersistentTileScheduler<MyConfig>;
 //   __global__ void gemm_kernel(...) {
 //     extern char smem_buf[];
@@ -58,10 +58,22 @@ namespace cutlass::gemm::kernel::detail {
 //     auto work = scheduler.initial_work_tile_info();
 //     while (work.is_valid()) {                  // 2. 自取循环
 //       compute_tile(work, smem_buf);            // 3. 算整块 tile
-//       work = scheduler.fetch_next_work(work)   // 4. 取下一块
-//              .get<0>();
+//       work = scheduler.fetch_next_work(work).get<0>();   // 4. 取下一块
 //     }
 //   }
+// 或 （基于advance_to_next_work）：
+//   __global__ void gemm_kernel(...) {
+//     extern char smem_buf[];
+//     typename Scheduler::Params params = *params_ptr;
+//     Scheduler scheduler(params);               // 1. 构造
+//     auto work = scheduler.advance_to_next_work().get<0>(); // 第一次直接领一块
+//     while (work.is_valid()) {            // 还有活就干
+//       compute_tile(work, smem_buf);      // 算整块 tile
+//       work = scheduler.advance_to_next_work().get<0>(); // 立即领下一块（指针已原子前移）
+//     }
+//   } 
+// advance_to_next_work() 仍是唯一“消耗槽”的底层原语；
+// fetch_next_work(old) 只是基于advance_to_next_work的高层便利包装，把“本地续算”（例如 tile 里还有 k-slice 没算完）和“全局换槽”两种分支合并成一次调用，用户不必自己写 if-else。
  
 // Users are not supposed to use this class directly.
 // This is a CRTP base class for the actual tile schedulers.
