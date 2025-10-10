@@ -583,7 +583,7 @@ struct CollectiveMma<
     // Mainloop GMMAs
     k_tile_count -= prologue_mma_count;
 
-    // <NT>S
+    // <NT> sm90 MainloopSm90TmaGmmaWarpSpecialized的mma函数里的 mainloop 阶段介绍
     //   mainloop阶段，直接进入steady-state 双缓冲：搬→算→搬→算…，每算完一 tile 就释放 smem 缓冲区；
     //   前面的prologue 把前 K_PIPE_MMAS 个 tile 算完，让 DMA 提前填下一批。即把 pipeline“灌满”到预定水位，
     // 让 TensorCore 和 TMA 搬运从第一拍就重叠；不释放缓冲区、不 wait GMMA，只为“预热”；mainloop 才带 
