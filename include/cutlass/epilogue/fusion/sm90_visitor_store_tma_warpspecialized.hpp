@@ -111,6 +111,7 @@ using namespace detail;
 //    * gAux_epi: TMA 最终要写的全局内存窗口, 处于gmem，flat-divide 视图。
 //               flat_divide: 把CTA子块再切成 (EPI_TILE_M, EPI_TILE_N) 大小的二维网格，并返回 (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N) 形状，
 //                            使TMA 可以按 (i,j) 坐标一次搬一个 EPI_TILE_M×EPI_TILE_N 小块，无需手动算偏移。
+//                            include/cute/layout.hpp
 //    * tRS_sAux: r2s的dst视图，内存对应 sAux_epi 。其src视图会基于tC_rAux进行构建。tC_rAux -> tRS_sAux(sAux_epi) 使用 STS.128 指令, sAux_epi -> gAux_epi 使用tma。
 //                r2s操作见 include/cutlass/epilogue/collective/builders/sm90_common.inl: sm90_get_smem_store_op_for_accumulator.
 //                sts.128 指令在SM80开始支持，sm90新增swizzle/bank-reorder修饰符，且可对齐到tma。更早的volta架构的是sts.64

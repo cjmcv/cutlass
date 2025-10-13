@@ -120,7 +120,7 @@ CUTLASS_HOST_DEVICE bool thread0() {
   #endif
 }
 
-// <NT> warp内线程id号(0-31)
+// <NT> warp内线程id号(0-31)。调用此函数时，warp 内的线程可能并未收敛（即可能处于warp分支发散状态）。
 /// Returns a lane index in the warp. The threads in warp may not be convergent
 CUTLASS_DEVICE
 int canonical_lane_idx() { 

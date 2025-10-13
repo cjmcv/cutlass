@@ -56,6 +56,8 @@
 //
 // 分别对应使用tma的bulk和使用普通的cp.async, 两个类型都带有Stages_参数，可分多阶流水处理，高效重叠数据加载和计算。
 // 消费者需要判断数据是否准备好，生产者需要判断消费者数据是否使用完成，底层会通过barrier来完成。
+//
+// 在sm90之前，并没有pipeline，使用cp.async这种异步指令需要手写cp.async.commit/wait。sm90后有封装的pipeline，可以直接用pipeline的arrive和wait函数.
 // 
 // api分两类：
 //  1) 生产者api: producer_try_acquire / producer_acquire / producer_commit / producer_tail / producer_get_barrier / producer_expect_transaction
@@ -89,6 +91,7 @@
 //         因为初始时 buffer 是空的，因此 producer 要比 consumer 提前半个周期，
 //         即producer 起步相位 = 1，consumer 起步相位 = 0。
 //
+//
 // <NT> OrderedSequenceBarrier 有序序列屏障介绍
 //   为 SM90+ 流水线设计，同一 stage 内按固定顺序 N→0→1→2→…→N-1→0 依次 arrive/wait，保证 producer i 永远先于 producer i+1 离开当前 stage，
 // 从而消除乱序竞争、简化指针切换逻辑。 
@@ -118,6 +121,9 @@
 // 长度（Length）	有顺序依赖,	同一段内 下一列要等上一列 arrive 才能开始, 必须顺序
 //
 // 使用时只用wait和arrive，如何对应到深度和长度？TODO?
+//
+// 三个大类的关系：如PipelineTmaAsync 是 TMA-bulk 的高阶“arrive/wait”外壳，内部用 PipelineState 做索引, OrderedSequenceBarrier 是可选的“顺序锁”，
+//                三者层级递减，后两个常被框架隐藏，用户只需 arrive()/wait()。
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {

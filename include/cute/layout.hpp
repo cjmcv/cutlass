@@ -412,6 +412,30 @@ make_layout(Layout<Shape0,Stride0> const& layout0,
 // Advanced Layout constructions
 //
 
+// <NT> make_ordered_layout 介绍
+// 设计目标: 给定遍历顺序，自动推导出最紧凑的内存布局
+// 案例，对比以下二者的区别：
+//  1) auto A0 = cute::make_tensor(cute::make_gmem_ptr(ptr_output), cute::make_shape(M, N), cute::make_stride(N, cute::_1{}));
+//  2) auto A1 = cute::make_tensor(cute::make_gmem_ptr(ptr_output), cute::make_layout(cute::make_shape(M, N), cute::make_stride(N, cute::_1{})));
+//  3) auto A2 = cute::make_tensor(cute::make_gmem_ptr(ptr_output), cute::Layout<cute::Shape<cute::_Int<M>, cute::_Int<N>>, 
+//                                                                              cute::Stride<cute::_Int<N>, cute::_1>>>{});
+//  4) auto B  = cute::make_tensor(cute::make_gmem_ptr(ptr_output), cute::make_ordered_layout(cute::make_shape(M, N), cute::make_step(cute::_1{}, cute::_0{}))); 
+//  A0/A1/A2是等价写法，完全一致。对比A1和B，可以看到主要就是make_layout和make_ordered_layout的区别，同时 make_layout 的第二个参数是 stride， make_ordered_layout的是 step.
+//  
+//  A是显式给出(row_stride, col_stride)=(N,1), 即同一行列间间隔1，为行主序，(m,n) = ptr + m*N + n*1。
+//  B使用了make_ordered_layout，会构造一个OrderedLayout：
+//    1. 先把 shape 里的维度按 step 值从小到大重新排序，这里 step = [1,0] 有 N:0 < M:1，即N是快速变化维，所以是行主序。
+//       shape[0]是N，shape[1]是M。
+//    2. 按调整的后顺序计算stride，所以有 stride[0] = 1， stride[1] = 1 * shape[0] = N。
+//       最终得到的结果会是 cute::make_layout(cute::make_shape(M,N), cute::make_stride(N, cute::_1{})));
+//  因此上面4种写法完全一致，特点是 make_ordered_layout 可以自动帮你算出紧凑的stride，以防止手动写错。
+// 
+// 注释案例分析：
+// 1) make_ordered_layout(Shape<_2,_2,_2,_2>{}, Step<_0,_2,_3,_1>{}) ->  (_2,_2,_2,_2):(_1,_4,_8,_2)
+//    因顺序为 0,2,3,1, 所以stride[0]是1，stride[3]=2*stride[0]=2, stride[1]=2*stride[3]=4, stride[2]=2*stride[1]=8
+// 2) make_ordered_layout(make_shape(2,3,4,5), make_step(Int<2>{}, 67, 42, Int<50>{})) -> (2,3,4,5):(_1,10,30,2)
+//    ？？？结果对不上，待验证<NT-TODO>
+
 // Make a compact layout with shape @a shape and strides following the order induced by @a order.
 // Dynamic values in @a order are ignored, considered large, and considered ordered from left to right.
 // Example:
@@ -1643,6 +1667,17 @@ tiled_divide(Layout<LShape,LStride> const& layout,
   return result(_, repeat<R1>(_));
 }
 
+// <NT> flat_divide 函数介绍
+// 功能: 将一个线性化的多维布局 layout 按照另一个分块布局 tiler 进行“结构化解包”，返回一个 可调用的映射对象。
+// 并且这个映射支持 延迟求值（lazy evaluation） —— 即你先定义如何分解，之后再传入具体的数值进行计算.
+//
+// 例如 (include/cutlass/epilogue/fusion/sm90_visitor_store_tma_warpspecialized.hpp)：
+//  Tensor gAux = local_tile(mAux, take<0,2>(args.tile_shape_mnk), make_coord(m,n,l)); // (CTA_M,CTA_N)
+//  Tensor gAux_epi = flat_divide(gAux, args.epi_tile);                                // (EPI_TILE_M,EPI_TILE_N,EPI_M,EPI_N)
+//  gAux 已经把全局张量 mAux 切成 一个 CTA 要处理的 (CTA_M, CTA_N) 大Tile，坐标系里只有 “CTA 内部” 这一条索引链。
+// 接下来要做 epilogue 级更细的并行划分——每个线程/小单元只写这个大Tile里的 一小块 (EPI_TILE_M, EPI_TILE_N)。
+// 于是需要 把刚才的 2D 瓦片再切成 4D 坐标：(EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N)      // (第几个 epi-tile，在该 epi-tile 内部的局部偏移)
+// 
 // Same as zipped_divide, but unpacks both modes: (BLK_A,BLK_B,...,a,b,...,x,y)
 template <class LShape, class LStride,
           class Tiler>
@@ -1775,6 +1810,11 @@ raked_product(Layout<TShape,TStride> const& block,
   return zip(get<1>(result), get<0>(result));
 }
 
+// <NT> tile_to_shape 将一个小的tile布局按照指定顺序重复排列，使其最终覆盖一个 target shape 的整个区域
+// block: 一个基本的 tile 布局（例如一个 warp 处理的 tile），包含 shape 和 stride 信息。
+// trg_shape: 目标形状（比如整个线程块要处理的 MxN 矩阵大小）。
+// ord_shape: 控制在哪个维度上优先重复 block 的顺序（默认是列优先，即先沿第一个维度扩展）。
+//            如设置为Step<_2,_1,_3>， 会先重复第二维，再第一维，最后第三维。而不设置的话，默认是123的顺序。
 // tile_to_shape -- Perform a product of a layout so that the result matches a target shape.
 // This is similar to blocked_product, but specifies the result shape instead of the
 //   product shape, which is more convenient in certain circumstances.

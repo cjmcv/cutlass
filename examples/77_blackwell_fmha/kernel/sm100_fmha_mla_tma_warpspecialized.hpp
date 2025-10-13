@@ -1768,6 +1768,7 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
 
     TiledMmaPV tiled_mma_pv;
     
+    // <NT> take<0, 2>是取[0,2)范围内的元素: include/cute/algorithm/tuple_algorithms.hpp # take(T const& t)
     Tensor tOtO = TiledMmaPV::make_fragment_C(partition_shape_C(TiledMmaPV{}, take<0, 2>(TileShapePV{})));
     tOtO.data() = tmem_o;
 
