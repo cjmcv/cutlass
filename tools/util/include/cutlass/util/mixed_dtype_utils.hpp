@@ -55,6 +55,45 @@ namespace cutlass {
     }                                                                   \
   }
 
+// <NT> dequantize_kernel
+// 要点：
+// 1) dq_buffer是反量化的输出，operand_layout是量化tensor的layout，layout中包含的shape和stride，这里为何能基于量化tensor的layout来构建反量化结果的tensor？
+//  -- 量化tensor和反量化tensor的shape是一致的，只是stride因为数据格式不同会有差别。在 dequantize 里我们根本没用到这些 stride，
+//   真正决定写回地址的是后面 local_tile + local_partition 产生的 新 Tensor 的指针和偏移；所以只要 shape 相同，layout 可以安全复用。
+//   local_tile 会：1) 根据 blk_coord 算出 新的 base pointer（dq_buffer + offset）.
+//                  2) 根据 blk_shape 算出 新的 shape（tpb,1,1）.
+//                  3) 重新构造一个不含原 stride 的 ComposedLayout，旧 stride 被丢弃.
+// 2) init_quantized_iterator
+//  -- 当每个元素 ≥ 8 bit（int8、fp8 …）, 直接返回普通的 gmem_ptr<T>，GPU 全局内存天然支持 1 字节对齐访问。
+//   当每个元素 < 8 bit（4-bit、2-bit、1-bit 等）返回 subbyte_iterator<const QuantizedElement>，
+//   这个迭代器内部会：1) 把指针当成 uint8_t* 逐字节加载；
+//                   2) 用位运算提取或写入对应偏移处的若干 bit；
+//                   3) 对外仍然表现成“一个元素”的引用，语法上像普通指针。
+//                  于是后面 make_tensor(init_quantized_iterator(), operand_layout) 得到的 gmem_op_q 无论元素多小，都能正确读出量化值，而 kernel 里剩下的代码无需再关心“位打包”细节。
+// 3) broadcasted_scale_layout 是广播的layout，其shape是 (n, make_shape(group_size, group_num), l). 原scale的shape是 (n, group_num, l)，访问时按broadcasted的坐标访问，自动广播数据。
+// 4）local_tile 是 block 级别划分，维度是(tpb, 1, 1, num_iters)
+//    local_partition是线程级划分，维度是(1, 1, 1, num_iters)
+//    make_fragment_like是寄存器划分，只需要一个实例就能推断出 元素类型 和 寄存器数组大小，此外除了num_iters，其他都是1，所以按(_, _, _, 0)来取即可。
+//    其中的num_iters的意思：由auto blk_coord = cute::make_coord(_, blockIdx.x, blockIdx.y);// [MN,K,L]，一个block负责固定KL下的所有MN，blk_shape是(128,1,1)，所以num_iters=MN//128（向上取整）
+// 5）for循环中，先根据坐标处理边界，逐个iter将量化的q/scale/zero都拷贝到寄存器，基于寄存器完成反量化：将q和zero都转到scale类型，计算 q*scale + zero，将类型转为反量化输出格式后保存会gmem。
+//    注意：反量化公式是(q - zero) * scale，而这里计算的是 q*scale + zero。
+//
+// 补充：
+// <NT> 分组量化逻辑，权重维度是src[N,K], 以group_size=128为例：
+// 1）将[1,128]的数据作为一组，一组有一个scale值，即对于每个[1,128]的原权重矩阵，找到其最大绝对值作为该组的scale，所以共得到scale[N,K/128].  
+// 2）对每个[1,128]的原权重矩阵，取出其scale，逐个元素除以scale，再乘以7放大到[-7,7]，即可完成整个量化计算。quant = round(w128 / scale * 7)
+//  如有zero：
+// 1）将[1,128]的数据作为一组，一组有一个scale值和zero值，先计算 zero=(该组的max+该组min)/2, 即为中心点center,而scale=max(abs(w-zero)),即减去zero后的绝对最大值，
+//    scale和zero的维度都是[N,K/128]。
+// 2）对每个[1,128]的原权重矩阵，取出其scale和zero，逐个元素先减去zero后除以scale，再乘以7放大到[-7,7]，即可完成整个量化计算。quant = round((w128 - zero) / scale * 7)
+//
+// <NT> blockwise / groupwise / channelwise / tokenwise / tensorwise 的区别
+// blockwise 常取[128,128]为一组，scale维度是[N//128, K//128]，同时针对N和K维度。
+// groupwise 常取[1,128]为一组，scale维度是[N, K//128]，针对K维度。
+// channelwise 以整个输出channel为一组，即一个N的所有K为一组，所以scale维度是[N, 1]
+// tokenwise 以一个token为一组，针对输入A矩阵[M,K], 即一个M的所有K为一组，所以scale维度是[M, 1]
+// tensorwise 是整个tensor为一组，即scale只有一个值。layerwise同tensorwise。
+
 template <
   class QuantizedElement,
   class DequantizedElement,
@@ -134,6 +173,14 @@ __global__ void dequantize_kernel(DequantizedElement* dq_buffer,
   }
 }
 
+// <NT> mix_gemm中的 dequantize 函数介绍 
+// dq_buffer是输出的反量化结果， q_buffer/scale_buffer/zero_buffer是输入的量化数据。
+// operand_layout 对应 q_buffer，如 make_layout(shape_B, stride_B) 
+//                                 -> shape_B = cute::make_shape(n,k,l);
+//                                 -> stride_B = cutlass::make_cute_packed_stride(StrideB{}, shape_B);
+// scale_layout 对应 scale_buffer, 与 operand_layout 类似，shape为(n, scale_k=k/g, l), 注意mnklg中的g是group_size.
+// scale_k是group_num, group_size*scale_k = k, 每个 group 的 scale 值被广播复制 group_size 次，正好对应权重矩阵里同一组的 group_size 个元素。
+// stride和shape会一一对应，shape中的group_size对应stride为0，即同一组里的 group_size 个元素都指向 同一份 scale 内存，实现“一次存放，多次复用”。
 template <
   class QuantizedElement,
   class DequantizedElement,
@@ -349,6 +396,45 @@ struct UnderlyingElement<T, cute::void_t<typename T::Element>> {
   using type = typename T::Element;
 };
 
+// <NT> compute_memory_reordering_atom: w4a16中权重shuffle的关键函数
+// 把 tensor core 指令的寄存器-TV(thread-value) 布局 逆向映射为一个 共享内存重排原子，使得 每个线程在共享内存
+// 中需要的数据连续且对齐，从而用 最宽向量加载 完成 mixed-dtype GEMM 中的窄类型加载，消除 sub-bank 冲突，最大化带宽。
+// 具体做法:
+//   1) 选一条 代表GMMA 指令 作为代表，把它的 TV 布局借出来。
+//      rs_op_selector 返回最合适给定参数的指令，其中 ElementC 和 TileShape 不影响TV布局，可以随便填。
+//      以MMA_Traits取得A矩阵TV布局 ALayout, 维度是(thr,val,mk)， 前两个维度就是 “哪个线程拥有哪几个值” 的映射表。
+//      size<1>(tv_layout_mma)取的是 val 的size，即一条 GMMA 里 每个线程拥有的元素个数，需要能整除 size(val_layout) 才能换序。
+//   2) tv_tiler_warp 是把线程数从128压到32，val不变，充当warp级别的切分器。
+//      原来 128 线程分 64×16 元素，现在 32 线程分 16×16 元素（M 维除以 4，K 维不变）。
+//      tv_layout_mma_warp: 把“全局 TV 布局”与“warp 拆分器”复合，得到 单 warp 的 TV 布局（仍是 thr,val → mk）
+//      mk_layout_mma_warp：求逆布局，得到(m,k) 坐标 → (thr,val) 编号，与tv_layout_mma_warp相反对应。
+//   3) 沿 K 方向把多个 warp 布局拼起来，换得更宽向量段。
+//      atom_layout 典型为 _4、_8，表示 把 4 或 8 个相邻 GMMA 的 K 段拼成一块。
+//      同一线程在共享内存中连续拥有的元素数 ×4/×8，后续可用 128-bit 加载 一次搬完。
+//   4) val_to_offset: 值偏移。值 → 线性偏移，例如 val_layout = _2 且原每线程 8 元素，则变成 0,1,8,9,16,17… 这种交织地址。
+//      thr_to_offset: 线程偏移。线程编号 → 线性偏移，简单 1-D 排列。
+//      tv_to_offset: logical_product 先把 值偏移 与 线程偏移 拼成二维。再 select<1,0> 把 值维放前面，
+//                    线程维放后面 → 保证 同一线程的所有值在地址上是相邻的。
+//      layout_atom: 最后composition(tv_to_offset, mk_layout_mma_trgt)，把 “(m,k) → (thr,val)” 与 “(thr,val) → offset” 复合，
+//                   得到 “(m,k) → offset” 的最终重排函数。
+//  layout_atom里包含了(m,k) 逻辑坐标 -> 线性偏移的映射关系，基于该关系在reorder_tensor中进行拷贝即可。
+//
+// <NT> sub bank冲突 与 bank 冲突
+//   回顾bank 冲突定义：一个 32-bank 共享内存，bank宽度 4 字节 (128 bit), 如果 warp 的 32 个线程同时访问 
+//                   同一个 bank 的不同地址，就会触发 bank conflict，事务被串行化。
+//   随着低精度（8-bit、4-bit）在 mixed-dtype GEMM 中大量出现，一个线程往往只读 1 字节甚至 0.5 字节。
+// 因此从 Ampere 开始把 每个 4-byte bank 拆成 4 个 1-byte sub-bank（Hopper 也有 2-byte sub-bank 模式）。
+// 如：
+//   | 访问宽度 | 每 bank 拆成 | 冲突条件                |
+//   | ------- | ------------ | ---------------------- |
+//   | 32-bit  |    1 × 4 B   | 不同线程访问 同 bank 不同 4 B 地址   |  即是传统意义上的bank冲突
+//   | 16-bit  |    2 × 2 B   | 不同线程访问 同 bank 同 2 B sub-bank |  
+//   | 8-bit   |    4 × 1 B   | 不同线程访问 同 bank 同 1 B sub-bank | 
+//
+//   避免冲突：1）让同一 warp 的线程访问不同 bank：一个warp不同线程访问同一个 bank 的不同地址，会造成bank冲突。
+//            2）让相邻线程访问不同 sub-bank：如每线程读取0.5B，两个0.5B处于同一个subbank，两个线程同时访问同一个subbank，即会存在subbank冲突。
+//                                   对数据做shuffle，使其交错，即可避免subbank冲突
+
 // Given a type of MMA instruction, compute a memory reordering atom that places all values
 // owned by each thread in contiguous memory locations. This improves smem load vectorization,
 // particularly for mixed dtype GEMMs where a narrow type is loaded in the thread/value order
@@ -392,6 +478,29 @@ constexpr auto compute_memory_reordering_atom(AtomLayout atom_layout = {}, ValLa
 
   return layout_atom;
 }
+
+// <NT> reorder_tensor / reorder_tensor_kernel 介绍，如在hopper中的w4a16实现里，对w4做offline shuffle时用到。
+// 1) 做shuffle的原因：
+// -- 对于float16或更高位宽的数据, ldmatrix 可以在硬件中高效完成数据shuffle,。但对于4bit并没有，无法做硬件shuffle，
+//    则需要 四次 8-bit 共享内存加载才能拼出一个符合 tensor core 布局的 32-bit 寄存器块。
+// 2) w4a16中的使用方式：
+//      using MmaType = cutlass::bfloat16_t;
+//      using ElementB = cutlass::int4b_t;
+//      using LayoutB = cutlass::layout::ColumnMajor;
+//      using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
+//      auto shape_B = cute::make_shape(n, k, l);
+//      StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, shape_B);
+//      auto layout_B = make_layout(shape_B, stride_B);
+//
+//      using ValueShuffle = cutlass::Layout<cutlass::Shape<cute::_2,cute::_4>, cutlass::Stride<cute::_4,cute::_1>>; // order [0,2,4,6,1,3,5,7]
+//      static constexpr int NumShuffleAtoms = 1;
+//      using MmaAtomShape = cutlass::Layout<cutlass::Shape<cute::_1,cute::Int<NumShuffleAtoms>>>;
+//      using LayoutAtomQuant = decltype(cutlass::compute_memory_reordering_atom<MmaType, MmaAtomShape, ValueShuffle>());
+//      using LayoutB_Reordered = decltype(cute::tile_to_shape(LayoutAtomQuant{}, cutlass::Layout<cutlass::Shape<int,int,int>, StrideB>{}));
+// 
+//      LayoutB_Reordered layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
+//      cutlass::reorder_tensor((ElementB *)weight.data_ptr(), layout_B, layout_B_reordered);
+//    关键函数是 compute_memory_reordering_atom 得到 (m,n)->offset关系 和 reorder_tensor 基于映射关系进行数据拷贝。
 
 template <class TileShape, class EngineSrc, class LayoutSrc, class EngineDst, class LayoutDst, class TiledCopy>
 __global__ void reorder_tensor_kernel(

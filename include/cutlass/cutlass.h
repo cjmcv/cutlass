@@ -131,9 +131,9 @@ int canonical_lane_idx() {
   #endif
 }
 
-// <NT> __shfl_sync 用于在warp内进行数据交换，原型：typename T __shfl_sync(unsigned mask, T var, int srcLane, int width = warpSize);
+// <NT> __shfl_sync 用于在warp内进行数据广播，原型：typename T __shfl_sync(unsigned mask, T var, int srcLane, int width = warpSize);
 // mask: 32位无符号整数，指定哪些线程会参与当前的数据交换操作，0xffffffff 意味着线程束内的所有 32 个线程都会参与此次操作。
-// var：要进行交换的数据. srcLane: 对应warp里线程号（0-31），填0，表示由warp里0号线程获取数据结果，并广播给其他参与此次操作的线程。
+// var：要进行交换的数据. srcLane: 对应warp里线程号（0-31），填0，表示由warp里0号线程获取数据结果，并广播给其他参与此次操作的线程。__shfl_sync返回值就是接收的广播值。
 // 返回一个warp索引
 /// Returns a warp-uniform value indicating the canonical warp index of the calling threads.
 /// Threads within the warp must be converged.
