@@ -46,6 +46,7 @@ struct StageCount {
   explicit StageCount(cute::Int<num_stages>) {}
 };
 
+// <NT> StageCountAutoCarveout: 一种自动化的策略，用于动态调整共享内存中预取数据的阶段数，Carveout是预留内存区域
 template<int carveout_bytes>
 struct StageCountAutoCarveout {
   static constexpr int bytes = carveout_bytes;
@@ -63,11 +64,13 @@ compute_carveout_from_epi();
 
 } // namespace detail
 
+// <NT> epi是尾声Epilogue
 template<class CollectiveEpilogue>
 struct StageCountAutoCarveoutEpi : StageCountAutoCarveout<detail::compute_carveout_from_epi<CollectiveEpilogue>()> {};
 
 using StageCountAuto = StageCountAutoCarveout<0>;
 
+// <NT> KernelScheduleAuto 用于自动让构建器选择内核调度。可以通过 cutlass/gemm/dispatch_policy.hpp 中的内核调度标签进行覆盖
 // Used to automatically let the builder pick the kernel schedule.
 // Can be overridden with kernel schedule tags in cutlass/gemm/dispatch_policy.hpp
 struct KernelScheduleAuto final {};

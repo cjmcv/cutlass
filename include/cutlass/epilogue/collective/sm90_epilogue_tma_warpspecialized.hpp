@@ -32,6 +32,12 @@
   \brief Functor performing elementwise operations used by epilogues.
 */
 
+// <NT> Sm90TmaWarpSpecialized 对应的 CollectiveEpilogue 介绍
+// 主要函数：
+// 1) load(LoadPipeline,LoadPipelineState...):
+// 2) store(LoadPipeline,LoadPipelineState,StorePipeline,StorePipelineState, accumulators):
+//    把“寄存器里的 MMA 累加器” -> 经过 EVT 融合变换 -> 先落 shared memory -> 再由 TMA bulk-store 异步写回 全局内存 D 的完整 epilogue 流水线. (详见下方函数定义处)
+
 #pragma once
 
 #include "cutlass/cutlass.h"
@@ -416,6 +422,34 @@ public:
     return fusion_callbacks.is_producer_load_needed();
   }
 
+  // <NT> Sm90TmaWarpSpecialized 对应的 CollectiveEpilogue.load 函数介绍
+  // 参数：
+  //   LoadPipeline \ LoadPipelineState: TMA 流水线 与 当前 stage
+  //   ProblemShapeMNKL: 整个问题的 [M, N, K, L]
+  //   TileShapeMNK: 一个 CTA 要算的 C tile 大小
+  //   TileCoordMNKL: 当前 CTA 在 全局网格里的坐标 (m, n, k, l)
+  //   subtile_idx: -1 表示 加载整个 epilogue tile；≥0 表示 只加载指定子块（用于 wave-level 并行）
+  // 步骤：
+  //   1) gC_epi: global C 先切成 CTA 级 tile，再 flat_divide 成 epilogue 子 tile
+  //      sC_epi: 形状与 gC_epi 一一对应，double-buffer 由 LoadPipeline 管理。维度(EPI_TILE_M,EPI_TILE_N,PIPE_C)，即是buffer数量，PIPE_C份smem。
+  //      以PIPE_C=2为例，即double buffer，流程如下：
+  //       | 时间片 | producer 动作       | consumer 动作          | buffer-0 | buffer-1 |
+  //       | ----- | ------------------- | ---------------------- | -------- | -------- |
+  //       |   0   | **load-0** -> buf-0 | —                      | 写        | 空      |
+  //       |   1   | commit-0            | **compute-0** 读 buf-0 | 读        | 空      |
+  //       |   2   | **load-1** -> buf-1 | compute-0 完成         | 读        | 写      |
+  //       |   3   | commit-1            | **compute-1** 读 buf-1 | 空        | 读      |
+  //       |   4   | **load-2** -> buf-0 | compute-1 完成         | 写        | 空      |
+  //       两个 buffer 交替读写，TMA 与 MMA/epilogue 完全重叠，无气泡。
+  //   2) bGS_gC/bGS_sC: partition_S / partition_D 把 global tile 与 shared tile 切成 TMA 线程块 视角，每个线程块 负责 一个子 tile 的搬运。
+  //   3) pld_callbacks: get_producer_load_callbacks (实现: include/cutlass/epilogue/fusion/sm90_visitor_*.hpp)
+  //   4) 循环加载:
+  //         load_pipeline.producer_acquire
+  //         pld_callbacks.step
+  //         copy: mcast_mask=0, 表示不需要multi-cast
+  //         load_pipeline.producer_expect_transaction
+  //         load_pipeline.producer_commit
+
   template<
     class ProblemShapeMNKL,
     class TileShapeMNK,
@@ -523,6 +557,40 @@ public:
 
     return load_pipe_producer_state;
   }
+
+  // <NT> Sm90TmaWarpSpecialized 对应的 CollectiveEpilogue.store 函数介绍
+  // 参数: 
+  //  1) load_pipeline: 调用 consumer_release/wait 消耗load_pipeline的数据.
+  //  2) store_pipeline: 调用 producer_commit/acquire 往store_pipeline生产数据.
+  //  3) accumulators: mma tile的计算结果，每个线程持有一块，数据驻留在寄存器。
+  //
+  // 编译分支：
+  //  1) is_C_load_needed: epilogue 是否需要把 C 当源数据（例如只做 alpha·acc 而不做 alpha·acc + bate·C时，会为False）
+  //  2) is_producer_load_needed: 范围更大，如为false，如没有任何全局数据需要搬进 shared memory（例如只做 D = alpha * acc，且 beta = 0、无 bias、无 aux），
+  //  3) ReuseSmemC: 是否把 smem C buffer 就地复用为 D buffer.
+  //
+  // 步骤：
+  //  1) 切片: 先拿到整个输出张量D的TMA视图 mD_mn。按CTA tile坐标切出本线程块要写的区域 gD。再按 EpilogueTile 拆成子块序列 gD_epi，每个子块对应一次 TMA bulk 事务。
+  //          获取与之对应的smem区域, 并做swizzle得到 sD_epi, 可同时满足 MMA 写/读的对齐与 bank-conflict-free。
+  //  2) 建立TiledCopy: tiled_copy_C_atom / tiled_r2r / tiled_r2s / tiled_s2r
+  //  3）融合回调(EVT)插入点: cst_callbacks = ... get_consumer_store_callbacks (实现: include/cutlass/epilogue/fusion/sm90_visitor_*.hpp)
+  //     1. cst_callbacks.begin() – 全局前置（scale 广播、指针准备）
+  //     For each tile:
+  //       2. cst_callbacks.begin_loop()
+  //       load_pipeline.consumer_wait - if (is_producer_load_needed)
+  //       copy - if (is_C_load_needed)
+  //       3. cst_callbacks.previsit(...) – 每个子块开始前（读 C 从 global→smem→reg）
+  //       load_pipeline.consumer_release - if (is_producer_load_needed)
+  //       4. cst_callbacks.visit(...) – 核心计算(在reg)：逐向量调用 (alpha*acc + beta*C) 计算，返回 变换后寄存器值
+  //       5. cst_callbacks.reduce(...) – 可选二次加工函数（aux store、activation、reduce），默认是空函数
+  //                        命名为reduce是历史遗留原因，最早是用于reduce的，后面被扩展。
+  //       6. cst_callbacks.postreduce(...) – 写回 shared memory 前（量化、swizzle）
+  //       7. cst_callbacks.tma_store(...) – TMA bulk 事务提交前（最后 scale、元数据）
+  //       store_pipeline.producer_commit
+  //       store_pipeline.producer_acquire
+  //       8. cst_callbacks.end_loop()
+  //     9. cst_callbacks.end()
+  //     所有融合逻辑 都封装在这几个回调里，store() 本身只负责“搬运”与“同步”。
 
   template<
     class ProblemShapeMNKL,

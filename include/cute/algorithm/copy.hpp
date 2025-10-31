@@ -61,6 +61,37 @@ copy_if(PrdTensor                    const& pred,
   }
 }
 
+// <NT> 谓语拷贝(基于条件复制掩码的拷贝)，拷贝原子操作copy_atom，谓语张量pred，
+// 使用示例：
+// 1> 创建一个tile copy的原子操作器(make_cotiled_copy是sm100的方法，也可以用 make_tiled_copy (include/cute/atom/copy_atom.hpp))
+// auto copy_op = make_cotiled_copy(
+//   Copy_Atom<UniversalCopy<uint128_t>, Element>{},
+//   make_layout(make_shape(_1{}, Int<sizeof(uint128_t) / sizeof(Element)>{})),
+//   regs.layout()
+// );
+// 2> 进一步获取当前线程负责的切片操作器，用于线程级的数据搬运。
+// auto thr_copy = copy_op.get_slice(_0{});
+// 3> 将gmem、regs 和坐标 coord 分别划分为适合当前复制操作的子张量。
+//    partition_D：对源数据进行分区; partition_S：对目标数据进行分区; 
+//    quantize(regs)：可能对寄存器数据进行量化，减少数据精度以提高计算效率
+// auto tCg = thr_copy.partition_D(gmem);
+// auto tCr = thr_copy.partition_S(quantize(regs));
+// auto tCc = thr_copy.partition_D(coord); // 生成掩码时，需要用到坐标tensor
+// 4> 计算张量秩 (R)
+// group_modes：将张量的维度进行重组，将第 1 到 R 维合并为一个向量维度，便于向量化操作
+// 创建布尔型掩码张量 (tCp_v)，用于控制条件复制
+// constexpr int R = decltype(tCr.layout())::rank;
+// auto tCg_v = group_modes<1, R>(tCg);
+// auto tCr_v = group_modes<1, R>(tCr);
+// auto tCc_v = group_modes<1, R>(tCc);
+// auto tCp_v = make_tensor<bool>(shape<1>(tCc_v));
+// 5> 生成条件复制掩码，确保只复制有效数据（坐标小于张量形状的部分）
+// for (int i = 0; i < size(tCp_v); ++i) {
+//   tCp_v(i) = elem_less(tCc_v(_0{},i), tensor_shape);
+// }
+// 6> 根据掩码tCp_v，有条件地将全局内存数据tCg_v复制到寄存器tCr_v
+// copy_if(copy_op, tCp_v, tCr_v, tCg_v);
+
 //
 // copy_if -- Predicated CopyAtom
 //

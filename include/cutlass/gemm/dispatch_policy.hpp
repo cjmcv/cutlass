@@ -28,6 +28,24 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+// <NT> warp specialize: sm90提出，可以将warp分成不同角色，一些负责数据加载，一些负责mma计算。
+// 而sm90之前一个warp里数据加载和mma需要交替进行，尽管multistage有数据预取的意思，但是数据读取和计算负载不一定均衡（可能数据读取耗时长），
+// 容易导致资源浪费。warp专用化之后，构建了生产者消费者模式，负责mma的warp只做计算，使数据预取颗粒度从stage级别细化到了warp级别，数据送达更及时，
+// 且生产者和消费者数量可以调整，使负载更均衡，资源利用最大化。
+//      
+// <NT>M 调度策略，分kernel级别和mma Mainloop(collective)级别, kernel内嵌Mainloop策略
+// Kernel 》》 
+// 1) KernelMultistage: 多级流水线，包含sm70的2阶和sm80/sm89的多阶，sm70没有异步的cp.async，只有同步的ldmatrix.sync
+// 2) KernelCpAsyncWarpSpecialized: cp.async是sm80提出的，sm90后也会沿用，而sm90在数据传输还有tma，所以会使用cp.async专门标记。同时使用了sm90提出的WarpSpecialize调度策略。
+// 3) KernelCpAsyncWarpSpecializedPingpong: 暂时没用上？
+// 4) KernelCpAsyncWarpSpecializedCooperative: 暂时没用上？
+// 5) KernelTma: 使用tma (与上面的cp.async相对应, 但不用经过reg从gmem到smem)，tma是sm90提出的，可搭配wgmma使用
+// 6) KernelTmaWarpSpecialized: 使用tma+wgmma，同时使用warp specialize策略。
+// 7) KernelTmaWarpSpecializedPingpong: 以上面为基础 + 对tma/wgmma的读写做多级流水线处理。这里pingpong与multistage意思相近，都是多级流水线处理。multistage针对gmem->(reg)->smem->reg->计算，pingpong针对tma和wgmma。
+// 8) KernelTmaWarpSpecializedCooperative: 
+// 9) KernelPtrArrayTmaWarpSpecializedCooperative:
+// 10) KernelPtrArrayTmaWarpSpecializedPingpong:
+
 #pragma once
 
 #include "cutlass/arch/arch.h"

@@ -182,6 +182,32 @@ struct Copy_Atom<Copy_Traits<Args...>, CopyInternalType>
 template <class TiledCopy, class ThrIdx>
 struct ThrCopy;
 
+// <NT> TiledCopy 基础结构体介绍
+// 功能：把 一个最小硬件复制单元（Copy_Atom） 放大成整个线程块级别的复制策略，并给出每个线程该读/写哪一段数据的所有布局信息。
+// 模板参数：* Copy_Atom: 最小复制单元（如 SM75_U16x8_LDSM_N），含 线程数、每线程值数、src/dst stride
+//          * LayoutCopy_TV:	(tid, val-id) -> 坐标 的映射，决定 线程/值如何铺到 MN 坐标系
+//          * ShapeTiler_MN:	MN 坐标空间 的 tiler，用于 把大 tile 切成 atom 倍数
+// 函数：
+// 1) tidfrg_S / tidfrg_D: 返回 源张量/目标张量 的子张量视图，形状是((thrV, thrX), frgV, restM, restN)，是数据，可以直接对它做 load、copy 等操作。
+//      * zipped_divide(tensor, Tiler_MN)：把 大 tensor 切成 (atom_tile, rest) 两级。
+//      * right_inverse(AtomLayoutRef{}).compose(AtomLayoutSrc{})：算出 (thr,val) -> atom 内偏移 的映射。
+//      * tile2thrfrg() 合并两步：把 atom 级 (thr,val) 映射到 MN 坐标；再把 rest 坐标 拼回来，最终返回 ((thrV, thrX), frgV, restM, restN) 形状的 子 tensor 视图。
+// 2) get_layoutS_TV / get_layoutD_TV：返回 (thr_idx, val_idx) → (M, N) 的 静态布局，只告诉你“第几个线程的第几个值应该落在哪个 MN 坐标”，不带数据，也不带子张量。
+//      * 所以：要 搬运/读写数据，用 tidfrg_S； 要自己再算坐标或重排，用 get_layoutS_TV。
+// 3) retile：把 TiledLayout_TV 里 前 V 个值 所覆盖的 MN 区域 算出来；用 inverse + divide 得到 (val_idx) → (M,N) 的 layout；返回 纯布局函数，不带数据，也不含线程信息。
+//      * 使用例子：auto val_layout = tiled_copy.retile(V);
+//                 auto smem_shape = shape(val_layout);   // 就可以知道要开多大共享内存
+// 4) get_slice: 返回 ThrCopy<TiledCopy, thr_idx> 对象，只含当前线程 要处理的 源/目标子 tensor。
+//
+// 基本使用方式：
+//   TiledCopy tiled_copy;
+//   auto slice = tiled_copy.get_slice(threadIdx.x); // 返回当前线程所负责的小块
+//   auto src_tile = slice.load_S(src_tensor);   // 当前线程要读的子 tensor
+//   auto dst_tile = slice.store_D(dst_tensor);  // 当前线程要写的子 tensor
+//   cute::copy(src_tile, dst_tile);             // 寄存器→寄存器 或 寄存器→shared
+//   其中的retile / get_layoutS_TV 在 构造 slice 对象时 已经用它们算出 每个线程的 thr_V, thr_X 范围，因此 不需要再暴露给使用者。
+//    load_S会调用tidfrg_S，store_D会调用tidfrg_D。
+
 template <class Copy_Atom,
           class LayoutCopy_TV,  // (tid,vid) -> coord   [Need not be 2D...]
           class ShapeTiler_MN>  // coord space
@@ -354,6 +380,19 @@ struct TiledCopy : Copy_Atom
   }
 };
 
+// <NT> ThrCopy 基础结构体介绍
+// 1) partition_S: Partition for src
+//        把源stensor划分成 当前线程 要搬运的那一小块，输出当前线程要读出的fragment。
+//        其中thr_tensor[num_threads_in_cta, tile_shape]，
+//        第0维用 thr_idx_ 切片后就只剩当前线程负责的那一块。
+// 2) partition_D: Partition for dst
+//        与partition_S对称，对应着目标dtensor，输出当前线程要写入的fragment。
+// 3) retile_S: 
+//        不依赖线程id，把全局张量 stensor 重新“铺平”成整组线程块级别的 tile 形状。
+//        partition_S中make_tensor用的是TiledCopy::tidfrg_S，而这里的是TiledCopy::retile。
+//        输出整个 CTA 的 tile 视图（不切片）。
+// 4) retile_D: 
+//        与retile_S对称，对应着目标dtensor，输出整个 CTA 的 tile 视图（不切片）
 template <class TiledCopy, class ThrIdx>
 struct ThrCopy
 {
@@ -481,6 +520,14 @@ make_tiled_copy_C_atom(Copy_Atom<CArgs...> const& copy_atom,
   return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
 }
 
+// <NT> make_tiled_copy 介绍
+// 通过逻辑线程布局 (thr_layout) 和值布局 (val_layout) 直接映射到目标张量坐标，生成平铺复制操作器。
+// (M,N)坐标 → thr_layout → 线程索引 (thr_idx)
+// (M,N)坐标 → val_layout → 值索引 (val_idx)
+// 线程与值的组合 (thr_idx, val_idx) → 目标张量坐标
+// * 适用于线程和值需要明确对应到特定坐标的场景。
+// 文档：media/docs/cpp/cute/0x_gemm_tutorial.md
+
 /** Produce a TiledCopy from logical thread and values layouts.
  * The thread and value layouts map coordinates to thr_idx and val_idx.
  *    The product of these layouts is taken to produce the TV layout and the Tiler.
@@ -516,6 +563,13 @@ make_tiled_copy(Copy_Atom<Args...> const& copy_atom,
   return make_tiled_copy_impl(copy_atom, layout_tv, tiler);
 }
 
+// <NT> make_cotiled_copy 介绍
+// 通过线程-值布局 (atom_tv_layout) 和数据布局 (data_layout) 的组合，生成平铺复制操作器。
+// (tid,vid)组合 → atom_tv_layout → 数据地址
+// 数据地址 → data_layout → 数据坐标
+// 线程与值的组合直接映射到数据地址，再转换为坐标。
+// * make_tiled_copy：适用于线程和值需要严格对应到特定坐标的场景，通过预定义布局直接构建映射关系，实现简单但灵活性较低。
+// * make_cotiled_copy：适用于线程和值更关注向量宽度和内存偏移的场景，通过线程-值到数据地址的映射，支持更灵活的内存访问模式，尤其适合向量化操作和不规则数据处理。
 /** Produce a TiledCopy from thread and value offset maps.
  * The TV Layout maps threads and values to the codomain of the data_layout.
  * It is verified that the intended codomain is valid within data_layout.

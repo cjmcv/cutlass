@@ -48,6 +48,9 @@
 #include "cutlass/arch/grid_dependency_control.h"
 
 ///////////////////////////////////////////////////////////////////////////////
+// <NT> GemmUniversal的KernelTmaWarpSpecializedCooperative类型的偏特化实现。
+// 核心函数是 operator()，为计算的主流程。
+// 
 
 namespace cutlass::gemm::kernel {
 

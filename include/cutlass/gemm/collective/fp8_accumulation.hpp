@@ -37,6 +37,7 @@
 //////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////FP8 Accumulation///////////////////////////
 //////////////////////////////////////////////////////////////////////////////
+/// <NT> 用于在 MMA 操作达到用户指定的最大间隔次数时，将tensor core累加器的结果 add 或 scale 到主累加器中，之后张量核心累加器将被清零。
 /// This class provides API to promote (add) or scale (multiply_add) the results 
 /// from the tensor core accumulators to the main accumulators when the number 
 /// of MMAs reaches the max number of MMA interval specified by user, after that

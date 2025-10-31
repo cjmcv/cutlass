@@ -743,6 +743,7 @@ CollectiveBuilder<
 private:
   using EpilogueTile_MN = decltype(detail::sm90_compute_tile_shape_or_override<
     ElementD, EpilogueTileType, Schedule, TileShape_MNK>());
+  // <NT> take<0, 2>是取[0,2)范围内的元素: include/cute/algorithm/tuple_algorithms.hpp # take(T const& t)
   // MSVC doesn't seem to be able to deduce DispatchPolicy correctly if it's
   // defined as decltype of a detail::sm90_get_tma_dispatch_policy call.
   // Instead, we paste in the contents of that function.  A natural refactoring

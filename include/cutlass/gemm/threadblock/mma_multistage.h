@@ -52,6 +52,33 @@ namespace gemm {
 namespace threadblock {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+// <NT> sm80的常用 multistage 调度逻辑，threadblock级别，充当kernel层级的Mma，
+// 如充当kernel/gemm_universal_streamk.h中GemmUniversalStreamk的MMA模板参数.
+// 一次操作处理一个threadblock的数据。
+// operator:
+//   // 先把接下来 kStages-1 轮计算要用的全局数据搬到共享内存里，把这条数据流水线先跑起来，防止后面计算时‘断粮’
+//   // 使用 cp.async (sm80开始支持，注意tma指令也是cp.async开头，都是异步拷贝指令，拷贝链路不经过寄存器， 
+//                     之前的LDG会经过寄存器，需要__syncthreads()等待导致堵塞，只能做到two-stage), 
+//   prologue(iterator_A, iterator_B, gemm_k_iterations);
+//   // 等至少有一个全局取数阶段完成后再继续。
+//   gmem_wait();
+//   // 用 src 累加器去初始化 dst 累加器。
+//   accum = src_accum;
+//   // 执行指定次数的 threadblock 的循环 mma 操作
+//   gemm_iters(gemm_k_iterations, accum, iterator_A, iterator_B);
+//      -> for stage: mac_loop_iter
+//         -> for warp_iter: warp_mma_
+//
+// 逻辑简化版本：
+//   预取第一次计算所需数据
+//   for 循环
+//   ? 异步发起下一次计算数据的拷贝
+//   ? 进行本次计算
+//   循环外完成最后一次计算
+// 
+// 该逻辑对two stage和multi stage都一致，区别在于two-stage的smem有两份，multi-stage是3份以上。
+// two-stage的同步用__syncthreads() 或 ldg + STS，multi-stage的同步用cp.async.wait_group.
+// 同步放在mma前，表示当前槽位的数据需要准备妥当。
 
 /// Structure to compute the matrix product targeting CUDA cores and SIMT math
 /// instructions.

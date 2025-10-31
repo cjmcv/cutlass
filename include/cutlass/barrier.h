@@ -76,6 +76,30 @@ struct NamedBarrierSync {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// <NT> CUDA原子操作 cuda::memory_order_xxx
+// | 顺序       | 作用                                                                        | 跨 GPU 可见性                         | 典型开销     |
+// | --------- | ---------------------------------------------------------------------------- | ------------------------------------ | ----------- |
+// | `relaxed` | 只保证原子性，**不保证任何顺序**                                               | NO 对侧 GPU 可能永远看不到             | 最低         |
+// | `consume` | 已弃用，CUDA 直接提升为 `acquire`                                             | 同 `acquire`                          | 同 `acquire`|
+// | `acquire` | **load 端**屏障；**拿到别人 release 的值后**，本线程后续读写不能重排到 load 之前 | YES 仅当对侧使用 `release` 时才保证可见 | 中等         |
+// | `release` | **store 端**屏障；本线程之前**所有写**对随后拿到该值的线程可见                   | YES 仅当对侧使用 `acquire` 时才保证可见 | 中等         |
+// | `acq_rel` | 读-改-写（RMW）一次性既做 `acquire` 又做 `release`                             | YES                                   | 较高         |
+// | `seq_cst` | 全局**单一总序**；所有 GPU + CPU 看到的原子操作顺序相同                         |  YES 最强                              | 最高         |
+
+// <NT> GenericBarrier 是使用 「一块共享内存 + 几条 PTX 指令」 实现的 block-wide 同步栅栏。（这里常用于sm90之前的stream-k）
+// 默认的 Barrier 中的 Sync 是 block级别的__syncthreads(); 
+// ld_acquire → 消费者读取计数器
+//            -> acquire屏障: 在这条指令之后，任何对同一块地址的读/写都不能重排到这条指令之前.（与 C++11 memory_order_acquire 等价）
+//            -> ld.global.acquire.gpu.b32: .global空间取数(smem也行)，.gpu 作用域为当前 GPU 内所有线程
+//               返回的 32-bit 值直接写进寄存器 state，函数把它作为结果返回。
+//            -> sm70以下没有硬件acquire
+// red_release → 使用 fence.acq_rel 栅栏把数据刷到 L2 并对全 GPU 可见
+//               -> 同时覆盖了 release 侧 和 acquire 侧 的语义，是PTX 里“双向”内存栅栏, 等价于 std::atomic_thread_fence(memory_order_acq_rel)
+//               -> 针对acquire 侧：保证 之前所有 global/shared 写 对别的线程可见；
+//               -> 针对release 侧：保证 之后的读写 不会重排到栅栏之前。
+//               再 red.relaxed.gpu.global.add 原子加 1 把计数器抬上去，用的是relax的原子加，因为上一句用的acq(acquire)已经保证了顺序。
+// 
+
 /// Group or CTA-wide semaphore for inter-CTA synchronization.
 template <class Sync>
 struct GenericBarrier {

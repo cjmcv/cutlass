@@ -38,6 +38,37 @@
 #include "cutlass/arch/cache_operation.h"
 #include "cutlass/platform/platform.h"
 
+// <NT>M ldmatrix.sync / cp.async 随架构演进
+// // sm75 turing 新增ldmatrix.sync，将数据从smem加载到寄存器。
+//                是同步拷贝指令，即在所有线程完成数据加载之前，Warp中的任何线程都不会继续执行后续指令，
+//                所以执行计算之前会确保所有线程都已加载了所需的数据，只能用two stage或叫double buffer。
+// ldmatrix.sync.aligned.x1.m8n8.shared.b16
+// ldmatrix.sync.aligned.x2.m8n8.shared.b16
+// ldmatrix.sync.aligned.x4.m8n8.shared.b16        * 看sm75的详细注解, ldmatrix与mma搭配使用
+// ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16
+// ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16
+// ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16
+//
+// // sm80 ampere 新增cp.async, 从gmem加载到smem，是异步拷贝指令，在数据拷贝的同时可以进行计算。
+//                所以此时优化开始可以采用multi-stage。
+//
+// * 看memory_sm80.h开头笔记
+// cp.async.ca.shared.global.L2::128B              
+// cp.async.ca.shared.global
+// cp.async.cg.shared.global.L2::128B
+// cp.async.cg.shared.global
+//
+// // sm90 hopper 新增tma tensor，从gmem加载到smem，也是异步拷贝指令，跟sm80的类似。
+//                区别在于bulk.tensor是TMA指令，拷贝张量(支持1d到5d的tensor，数据量不固定)，支持gmem和smem的双向拷贝。
+//                ca.shared是普通拷贝指令(一次拷贝4/8/16字节)，仅支持gmem到smem单向拷贝。
+// TMA：Tensor Memory Accelerator，张量内存加速器，是hopper新增的硬件单元，通过cp.async.bulk.tensor使用。
+//
+// * 解析笔记见：cute/arch/copy_sm90_tma.hpp, 支持1d到5d的tensor拷贝，下面是1d的，2d至5d类似。
+// cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint
+// cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint
+// cp.async.bulk.tensor.1d.global.shared::cta.bulk_group
+
+
 namespace cutlass {
 namespace arch {
 
@@ -359,7 +390,9 @@ struct global_store;
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-
+// <NT> st.global.v4.u32: st 存数据到 global 内存，一次4个元素，每个元素32位，即一次128位=16个8位
+// 所以 global_store<AccessType, 64> 是一次存放16个32位元素2=512位。
+// pred_guard为true时，@p的四条指令正常运行，为false则跳过。
 template <typename AccessType>
 struct global_store<AccessType, 64> {
   CUTLASS_DEVICE

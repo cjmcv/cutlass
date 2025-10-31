@@ -56,6 +56,86 @@ using namespace detail;
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// <NT> Sm90AuxStore介绍
+// 1. 初始条件
+//   * is_m_major: 根据StrideMNL中第0维度的M步长是否为1作为判断依据
+//   * SmemShapeTma: 以 using EpilogueTile = tile<64, 128> float 为例
+//                  | `get<0>(EpilogueTile{})`                          | 64               |
+//                  | `get<1>(EpilogueTile{})`                          | 128              |
+//                  | `make_layout(64)`                                 | `layout<64, 1>`  |
+//                  | `make_layout(128)`                                | `layout<128, 1>` |
+//                  | `max_common_vector(layout<64,1>, layout<64,1>)`   | 4（假设 128-bit 向量） |
+//                  | `max_common_vector(layout<128,1>, layout<128,1>)` | 4                |
+//                  | `make_shape(4, 4)`                                | `tuple<4, 4>`    |
+//                 例子中得到 4x4 的向量， 一个向量 指的是 128-bit (16-byte) 硬件向量。
+//                 max_common_vector的作用是 接受两个 layout 对象，返回一个 最大公共向量长度 ，这个长度满足：两个layout都可以被这个长度整除，且对齐方式一致。
+//               因为TMA要求 共享内存地址必须对齐到 128-bit 边界，所以 共享内存的形状必须满足向量对齐要求。
+//   * SmemLayoutTma: 按全局内存主序，把无冲突原子小块 SmemLayoutAtom 放大到共享内存目标形状 SmemShapeTma 的最终布局类型——保证 TMA 加载/存储时 既向量对齐，又无需额外转置（因为按全局内存主序进行排布）
+//               以SmemLayoutAtom=tile<8,8>; SmemShapeTma = tuple<4,4>; is_m_major = true; 元素类型为 float 为例。
+//               以128bit向量为视角，一个向量有4个元素=128bit，而SmemLayoutAtom共64个元素，每4个元素一个向量，即共16个向量。正好就是SmemShapeTma的16个向量。只需要排布，不需要扩展。
+//               SmemLayoutAtom的8x8元素，按向量为单位，则变成了2x8的网格, 所以需要 (2,8)=>(4,4)；而is_m_major=true对应Step<_2,_1>，表示M维把2条向量捆成一份，N维按单条向量步进。
+//               首先会将SmemLayoutAtom的2x8个向量按一维排布成0,1,2...15, 按<2,1>切片，得到[[0,1],[2,3],[4,5],[6,7],[8,9],[10,11],[12,13],[14,15]] 共8个子片，
+//               最终得到   m\n   0   1   2   3   如m方向的[0,1]为一组绑定连续，[2,3],[4,5]等亦然。
+//                          +------------------
+//                          0 |  0   2   4   6
+//                          1 |  1   3   5   7
+//                          2 |  8  10  12  14
+//                          3 |  9  11  13  15
+//               对应老布局 m\n|  0  1  2  3  4  5  6  7  即以SmemLayoutAtom平铺到smem。
+//                         ---+------------------------
+//                          0 | 0  2  4  6  8 10 12 14
+//                          1 | 1  3  5  7  9 11 13 15
+//               注：bank位宽是32bit=4B，布局中一个编号是一个向量16B，计算老布局的地址得到 [0 32 64 96 128 160 192 224]，[16 48 80 112 144 172 208 240]
+//                   分别对应bank((addr/4)%32)=[0 8 16 24 0 8 16 24]，[4 12 20 28 4 12 20 28]，bank 绕回，会存在bank冲突？
+//                --> 不会存在bank冲突，TMA 描述符里要求的 128 B 对齐 已隐含“无冲突”，只要共享内存段落 16 B 向量对齐、连续，TMA 就能 单周期 128 B 写回，不受 bank 绕回影响。
+//                --> tma是由一个线程发起，交由硬件完成，通常是一个warp里选举一个线程来发起搬运请求，其他线程不需要参与搬运。如 bool issue_tma_load = cute::elect_one_sync();
+//    * SmemLayout: SmemLayoutTma是“TMA 搬运单元”的共享内存布局，SmemLayout则是 Epilogue 真正用的整块共享内存，把 SmemLayoutTma 再沿着 M/N 放大到整个 tile 尺寸，
+//                 并 沿 K（Stages）深度方向复制 2/3 份（双缓冲/三缓冲），供 流水线 使用。
+//    * TMA_Aux: TMA store 描述符对象（类型里包含 共享内存布局、全局内存形状、stride、对齐信息 等）。
+//               其中的make_tensor(nullptr, repeat_like(StrideMNL{}, 0), StrideMNL{})表示 全局内存“形状+stride”原型：
+//             -- nullptr 只是类型占位，不分配内存；
+//             -- repeat_like(StrideMNL{}, 0) 把 leading dimension 重复成 0（后面运行时再填真实指针）；
+//             -- StrideMNL{} 给出 全局张量的 stride 模式（与共享内存 1:1 映射）。
+//               后面的SmemLayoutTma即是 共享内存布局。
+//               TMA_Aux其本质是一个TileCopy的偏特化结构体：https://github.com/cjmcv/cutlass/blob/6a079a69e44749e83892623a6729c53f8965f80f/include/cute/atom/copy_atom.hpp
+//
+// 2. get_consumer_store_callbacks（定位 “ ConsumerStoreCallbacks<decltype(tC_rAux) ” ）:
+//    * mAux: params_ptr->tma_store_aux.get_tma_tensor 获取的是全局内存视图，在TMA_Aux中以nullptr充当占位符，在实际使用时会被赋值为实际地址。
+//               那么此时get_tma_tensor就可以获得基于该地址的全局内存视图。为所有cta共享
+//    * gAux: 使用tile_shape_mnk进行划分，因此对应的是一个cta所属的切片，即当前 CTA 要写的子矩阵。
+//    * tC_gAux: 当前线程可见的“微块”视图（已按复制流水线重排）,也是全局内存。
+//    * tC_rAux: 同形零时缓冲区——计算结果先写这里，再 TMA store 到上面。寄存器里真正 malloc 了一块 (CPY×CPY_M×CPY_N) 个元素，为线程私有。
+//               零时缓冲区永远比全局视图少一维（去掉 EPI_M/N），因为寄存器只装“当前线程要写的值”。
+//    * sAux_epi: 线程块内部计算用的寄存器回写缓冲区, 处于smem，是bank-swizzle 视图。
+//               as_position_independent_swizzle_tensor: 接受 普通共享内存 tensor，在编译期做swizzle, 使得同一warp 线程写相邻元素时落在不同bank，并返回新 tensor 视图，形状不变，stride 被改写。
+//    * gAux_epi: TMA 最终要写的全局内存窗口, 处于gmem，flat-divide 视图。
+//               flat_divide: 把CTA子块再切成 (EPI_TILE_M, EPI_TILE_N) 大小的二维网格，并返回 (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N) 形状，
+//                            使TMA 可以按 (i,j) 坐标一次搬一个 EPI_TILE_M×EPI_TILE_N 小块，无需手动算偏移。
+//                            include/cute/layout.hpp
+//    * tRS_sAux: r2s的dst视图，内存对应 sAux_epi 。其src视图会基于tC_rAux进行构建。tC_rAux -> tRS_sAux(sAux_epi) 使用 STS.128 指令, sAux_epi -> gAux_epi 使用tma。
+//                r2s操作见 include/cutlass/epilogue/collective/builders/sm90_common.inl: sm90_get_smem_store_op_for_accumulator.
+//                sts.128 指令在SM80开始支持，sm90新增swizzle/bank-reorder修饰符，且可对齐到tma。更早的volta架构的是sts.64
+//    * bSG_sAux, bSG_gAux: tma s2g的src和dst视图，分别对应 sAux_epi 和 gAux_epi,
+//    *基本流程: 计算结果 -> 写寄存器 tC_rAux -> 用sts指令拷贝到 tRS_sAux(sAux_epi) (在 postreduce 函数中执行) -> 使用tma拷贝从 bSG_sAux(sAux_epi) 到 bSG_gAux(gAux_epi) (在tma_store中执行)
+//             只会用到 tC_rAux / tRS_sAux / bSG_sAux / bSG_gAux, 其他变量都是在初始化和编译期间完成处理。
+//
+// 补充扩展：
+// <NT>M g2s, s2g, s2r, r2s 的操作汇总
+//     g2s 的操作有:
+//        1) 普通的 cp.async (32B,amphere，仅g2s) 
+//        2) tma的 cp.async.bulk (128B+，hopper，g2s和s2g均支持)
+//        3) 传统的 ldg.128 (gmem->reg) + sts.128 (reg->smem)。 可见cp.async 不经过寄存器，amphere之前的用ldg+sts都需要经过寄存器。
+//     s2g 的操作有:
+//        1) 异步tma的 cp.async.bulk;
+//        2) 同步的 lds (smem->reg) + stg (reg->gmem); lds是从smem加载，stg是保存到gmem，目标都是reg，ldg和sts依然。
+//     s2r 的操作有:
+//        1) 同步的lds; 
+//        2) 同步的ldmatrix (即是ldsm，仅服务于mma/wmma，amphere支持); hopper之后的wgmma会直接以smem为数据源，不再需要配套s2r的加载指令。
+//     r2s 的操作有:
+//        1) 同步的sts;
+//        2) 同步的stmatrix (即是stsm, 与ldmatrix对应，但是从hopper才开始支持，可将mma/wmma/wgmma的数据回存到smem；
+//                           注：wgmma仅是输入的AB矩阵可以从smem直接取数，但是输出矩阵C仍然是在reg的, 因此仍然需要有配套r2s的操作)
+
 template <
   int Stages,
   class EpilogueTile,

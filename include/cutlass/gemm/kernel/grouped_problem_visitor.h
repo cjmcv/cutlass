@@ -32,7 +32,65 @@
 /*! \file
     \brief Base scheduler for grouped problems
 */
-
+// <NT> GroupedProblemVisitor 是sm80的分组gemm中调度引擎, 核心函数是next_tile()。
+// next_tile: 让 当前CTA 在任意大小、任意数量的GEMM problem序列里，快速、无锁地 找到 “下一个该我算的tile” 属于 哪个问题、哪个坐标，并把所有必要信息填进基类字段；
+// 返回 false 时表示所有问题所有 tile 都已排完，内核可以退出。
+// 因主循环就变成这样：GroupedProblemVisitor visitor(...);
+//                   while (visitor.next_tile()) {   // ← 就是它在干活
+//                     GemmCoord threadblock_offset = visitor.get_threadblock_offset(...);
+//                     // 真正算 GEMM
+//                   }
+// 定义和使用位置: include/cutlass/gemm/kernel/gemm_grouped.h: GemmGrouped
+// 
+//  这里GroupedProblemVisitor主要划分了两种模式，分别对应: cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly  / kHostPrecompute
+// kDeviceOnly: 所有调度都在device端执行。搜 GroupedProblemVisitor->kDeviceOnly
+// kHostPrecompute： 在主机上预先计算待访问的完整问题序列。搜 GroupedProblemVisitor->kHostPrecompute
+//
+//
+// <NT> warp shuffle指令: __shfl_sync / __shfl_up_sync /  __shfl_down_sync / __shfl_xor_sync
+// 1）int __shfl_sync(unsigned mask, int var, int srcLane, int width=warpSize): 指令单周期完成，是 warp内 通信的最快方式。
+//  基于掩码 0xffffffff, 可以把第 srcLane 号线程的 var 广播给本 warp 所有线程，通过函数返回值拿到该广播值。
+// 2）int __shfl_up_sync(unsigned mask, int var, unsigned int delta, int width=warpSize)：指令单周期完成，往前看 delta 位，拿得到就拿，拿不到就用自己的。
+//  掩码仍固定为 0xffffffff，delta是序号偏移量，以delta = 1为例，
+//  如lane0输入var0为10, 由delta=1得到目标lane是-1，越界用自己的，则返回值为10；
+//  lane1输入var1为20，由delta=1得到目标lane是0，则返回值为var0的10；
+//  lane2输入var2为30，由delta=1得到目标lane是1，则返回值为var1的20；
+//   典型用法是前缀和：
+//             for (int delta = 1; delta < warpSize; delta <<= 1) {
+//               int val = cc(0xffffffff, problem_ending_tile, i);
+//               if (lane_idx >= i) problem_ending_tile += val;
+//             }
+//             如一个warp的初始值为 11111111 11111111 11111111 11111111
+//             第一次 delta=1：    12222222 22222222 22222222 22222222
+//             第二次 delta=2：    12344444 44444444 44444444 44444444
+//             第三次 delta=4：    12345678 88888888 88888888 88888888
+//             第四次 delta=8：    12345678 9.....16 16xxxxxx xxxxxx16
+//             第五次 delta=16：   12345678 9.....16 17....24 ......32
+// 3）int __shfl_down_sync(unsigned mask, int var, unsigned int delta, int width=warpSize) 
+//  与 __shfl_up_sync 对应，方向相反，从高位到低位。加上广播可用于规约（__shfl_up_sync也一样，只是一个广播最后一位，一个广播第一位）。
+//             __device__ int warpReduceSum(int val) {
+//               #pragma unroll
+//               for (int offset = warpSize/2; offset > 0; offset >>= 1)
+//                 val += __shfl_down_sync(0xffffffff, val, offset);
+//               return val;          // lane-0 为总和
+//             }
+//             return val;
+//             对于reduce需要再使用广播 __shfl_sync(0xffffffff, val, 0)
+// 4）int __shfl_xor_sync(unsigned mask, int var, int laneMask, int width=warpSize)，warp内以 异或模式 交换数据，而异或就是“无进位二进制加法”
+//   var是需要交换的变量；laneMask决定“和谁交换”，是2的幂(1/2/4/8/16)，可理解成距离，1为相邻两个线程交换，2为间距2的线程交换。
+//             __device__ int warpReduceSum_xor(int val) {
+//               #pragma unroll
+//               for (int i = 1; i < warpSize; i <<= 1)
+//                 val += __shfl_xor_sync(0xffffffff, val, i);
+//               return val;          // **所有 lane** 都等于总和，不需要广播，warp reudce一般都用该方法
+//             }
+//           如一个warp的初始值为    1 1 1 1 1 1 1 1   1 1 1 1 1 1 1 1   1 1 1 1 1 1 1 1   1 1 1 1 1 1 1 1
+//           第一次 laneMask=1：    22 22 22 22   22 22 22 22   22 22 22 22   22 22 22 22    (相邻两两做异或，即相加)
+//           第二次 laneMask=2：    4444 4444   4444 4444   4444 4444   4444 4444            (间距2，两两做异或)
+//           第三次 laneMask=4：    88888888 88888888 88888888 88888888                      (间距4，两两做异或)
+//           第四次 laneMask=8：    16...............................16                      (间距8，两两做异或)
+//           第五次 laneMask=16：   32...............................32                      (间距16，两两做异或，至此所有线程都拿到了reduce结果，不需要再广播)
+//
 #pragma once
 
 #include "cutlass/cutlass.h"
@@ -235,6 +293,24 @@ struct GroupedProblemVisitor<ProblemSizeHelper,
     this->problem_tile_start = 0;
   }
 
+
+  // <NT> GroupedProblemVisitor->kDeviceOnly:
+  // 作用概述: 给“当前线程”分配一个 tile，并告诉它 这个 tile 属于哪个 problem、在该 problem 内的局部编号是多少。
+  //     即需要计算得到以下三个变量：
+  //        this->problem_idx        // 要算的 problem 编号
+  //        this->problem_tile_start // 该 problem 的第一个全局 tile 序号
+  //        this->tile_idx           // 当前线程接下来要算的全局 tile 序号
+  //     一个线程只处理一个 problem，一个warp 32个线程负责一组的32个problem。
+  //     函数返回true表示“已领到 tile”；返回 false 表示“没有 tile 可领”。领完后在next_tile函数外做实际gemm的计算。
+  // 大致流程：1) 前缀和产生全局边界
+  //          2) 线程每次 next_tile() 用 __ballot+__popc 二分查找边界
+  //          3) 把 global_tile_idx 翻译成 (problem, 局部 tile)
+  //      
+  // next_tile 函数步骤。。。(TODO)：
+  //  1) 广播：使所有线程 都知道“当前问题”结束边界 problem_tile_end，如果当前tile在这个范围内，则直接退出去执行gemm计算，否则需要给该tile换一组problem（32个problem为一组）。
+  //         注意 ProblemVisitor 在operator中创建，每个线程创建一份，但构建以block_idx为基础，所有一个block内所有线程的该类对象是一样的。
+  //  2）换一组problem：lane-31 总是保存“这组最后一个问题”的结束 tile（前缀和结果）。所以基于lane-31去广播，拿到group_tile_end就能判断 整组 32 个问题 是否全部排完。
+  //
   CUTLASS_DEVICE
   bool next_tile() {
     // Check whether the tile to compute is within the range of the current problem.

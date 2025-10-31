@@ -32,7 +32,26 @@
 
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 
-
+// <NT> gemm/colletcive 是mma的mainloop的实现集合
+//      epilogue/collective 是epi的mainloop的实现集合
+// 整体层级关系是：gemm/device -> gemm/kernel -> gemm/collective mainloop + epilogue/collective 
+//                                                -> block/warp/thread           -> block/warp/thread
+// sm90的例子：
+// using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<...>::CollectiveOp;
+// using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<...>::CollectiveOp;
+// using GemmKernel = cutlass::gemm::kernel::GemmUniversal<cute::Shape<int,int,int,int>,
+//                                                         CollectiveMainloop,
+//                                                         CollectiveEpilogue,
+//                                                         TileScheduler>;
+// 1）CollectiveMainloop 需要设置 mainloop schedule 的类型，主要有TmaWarpSpecializedPingpong / TmaWarpSpecializedCooperative / TmaWarpSpecialized / Tma 四类。
+//    类型确定后，其实现代码在 cutlass/gemm/kernel/collective/sm90_mma_tma_gmma_rs_warpspecialized.hpp / sm90_mma_multistage_gmma_ss_warpspecialized.hpp
+// 2) GemmKernel 在 cutlass/gemm/kernel 文件夹下，以 Pingpong 的 mainloop schedule 为例，
+//    gemm::kernel::GemmUniversal的偏特化实现在 cutlass/gemm/kernel/m90_gemm_warpspecialized_pingpong.hpp
+// 3）CollectiveEpilogue 在 TmaWarpSpecialized 的 epilogue 为例，实现代码在 epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp
+// 4）如 CollectiveEpilogue 中使用了EVT，实现代码在 epilogue/fusion/sm90xxx.hpp, 
+//    作为FusionCallbacks会被插入到sm90_epilogue_tma_warpspecialized中， 在store函数中通过visit调用。
+// 5) TileScheduler 实现代码在 include/cutlass/gemm/kernel/sm90_tile_scheduler.hpp / sm90_tile_scheduler_stream_k.hpp
+// 流程：kernel -> mma(mainloop) -> epi(store函数存结果前，调用evt)
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "cutlass/gemm/collective/sm70_mma_twostage.hpp"

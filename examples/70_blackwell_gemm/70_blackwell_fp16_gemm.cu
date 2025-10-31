@@ -54,8 +54,13 @@
     Usage:
       $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm --m=8192 --n=8192 --k=8192
 */
-
-
+// <NT> Blackwell（sm100a）新特性摘要
+// 1) 新增了一整套 Tensor Core MMA 指令（tcgen05），其吞吐量是 Hopper Tensor Core MMA 指令（WGMMA）的两倍。
+//   注意：WGMMA 指令在 Blackwell 上无法兼容。(参考 https://docs.nvidia.com/cuda/parallel-thread-execution)
+// 2）引入了全新的 per-SM 内存，名为Tensor Memory（TMEM）。使 MMA 指令把累加结果直接写入 TMEM，而不再存入寄存器文件。（请参考 CUDA 12.8 文档 https://docs.nvidia.com/cuda/）。
+// 3）扩展 warp-specialized：借助 TMEM，可将 MMA 计算与 epilogue 阶段彻底拆分到不同 warp 中并行执行。
+// 4）基于 cluster launch control，新增了一套由软件控制的动态调度器（参见 https://docs.nvidia.com/cuda/parallel-thread-execution）。
+    
 
 #include <iostream>
 

@@ -31,6 +31,9 @@
 
 #pragma once
 
+// <NT> ss_op_selector / rs_op_selector / ss_op_selector_sparse / rs_op_selector_sparse
+// 
+
 #include <cute/config.hpp>
 #include <cute/arch/mma.hpp>
 
@@ -347,7 +350,9 @@ struct MMA_16x8x16_C64C64C64C64_TN
 #include <cute/util/type_traits.hpp>           // cute::is_same_v
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// <NT> ss_op_selector 和 rs_op_selector 都是用于选择gmma的计算函数。
+// 里面会按数据类型/TileShape/行主序列主序进行选择，ss和rs区别在于操作数A的存放位置，s是smem，r是rmem。
+// 详情看：include/cute/arch/mma_sm90_gmma.hpp，搜'<NT> 后缀为SS和RS的gmma函数的区别'
 namespace cute {
 namespace SM90::GMMA {
 

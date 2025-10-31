@@ -52,6 +52,40 @@ namespace gemm {
 namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+// <NT> stream-k的核心mainloop代码 
+// 调用链路(对应demo 47_ampere_gemm_universal_streamk)：
+//
+// 1) gemm::device::GemmUniversal           -> device/gemm_universal.h
+// 2)  gemm::device::GemmUniversalBase      -> device/gemm_universal_base.h
+// 3)  gemm::kernel::DefaultGemmUniversal   -> kernel/default_gemm_universal.h
+// 4）   gemm::kernel::DefaultGemm          -> kernel/default_gemm.h
+// 5)    gemm::kernel::GemmUniversalStreamk -> DefaultGemmUniversal中的SelectBase<SwizzleT, typename SwizzleT::StreamkFeature> 
+//                                             由模板参数gemm::threadblock::ThreadblockSwizzleStreamK 可选中该mainloop
+// 其中 Mma_在sm80下可能会选中   gemm::threadblock::MmaMultistage -> gemm/threadblock/mma_multistage.h
+//     ThreadblockSwizzle_ 会是 gemm::threadblock::ThreadblockSwizzleStreamK -> threadblock/threadblock_swizzle_streamk.h
+
+// <NT> stream-k的基本思路
+// 与stream-k对应的两种实现，分别是DP和split-k。
+// * DP (data-parallel) 是典型实现，把k维度一次跑完，每个 CTA 独立处理一个输出 tile，无需跨 CTA 同步或归约，算力利用率高。
+//     缺点：1）当tile数量不是sm数量的整数倍时，wave quantization 问题严重 (如共100个sm，铺完整份数据需要120个block，则有20个sm会计算两份，则整体时间按两次算)。
+//          2）针对K非常大M/N很小的情况，因为一个block需要把K完整算完，计算量很大，但M/N方向小，则可以同时计算的block数量少，导致sm无法都被用起来。
+// * split-k 把 K 切成固定段，最后要一次全局归约。能解决DP的第2个缺点，每个tile压力减小，段数等同于M/N方向，可以分出sm并行计算。
+//     缺点：同样存在wave quantization问题，但能解决DP的第2个缺点。
+// * stream-k 优化split-k，弱化wave的概念，
+//     与split-k的本质区别：split-k是固定顺序，哪些sm负责哪些tile，在启动时就已经确定；
+//                        而stream-k是抢任务，哪个sm有空就哪个sm上，哪个sm负责哪个tile在运行之前是不确定的。
+//                     所以stream-k在启动前需要先设定一共要启动多少持久 CTA。每个持久 CTA 在内部 while-loop 里通过 atomic 抢迭代，直到把全局迭代池吃光。
+//     缺点：会存在tile-processing skew，因为sm命中区域是乱序的，所以L2命中率会比按顺序的split-k要低。只能从sm的使用率方面起到加速效果。
+//
+// 概念补充：
+//    DP 和 streamk 均与 multistage 是不同层级的策略，multistage搭配DP和streamk使用，
+//  与 tile 分配无关，作用于主循环。而DP和streamk则主要针对tile的分配问题。
+//  在sm80/86/89都默认使用multistage（cp.async），sm75使用two-stage（ldmatrix.sync）。可回看 include/cutlass/arch/memory.h
+
+// <NT> stream-k的实现主体概述
+// 主体框架是先使用DP，再使用stream-k的方式进行，分别对应 dp_block 和 sk_block
+// 用 DP 吃掉“大块且对齐”的计算，保证缓存友好；用 Stream-K 只啃“尾巴”零碎 tile，把 SM 利用率打到 100 %，
+// 同时把stream-k所需要做的 同步和 skew 限制会被限制在最后一两个 tile 里（最后一个wave）。
 
 template <
   typename Mma_,                  ///! Threadblock-scoped matrix multiply-accumulate
@@ -115,6 +149,8 @@ public:
   // Structures
   //
 
+  // <NT> batch_count：在kBatched模式下就是batch，但在kGemm模式下可充当split-k参数用(2则k分两段)
+  //      avail_sms: 专用于stream-k的参数，将尝试在指定数量的 SM 之间进行负载均衡（其中 - 1 表示默认使用设备的全部 SM 数量，1 表示采用传统的数据并行调度方式）
   /// Argument structure
   struct Arguments {
 
@@ -950,6 +986,7 @@ protected:
       warp_idx,
       lane_idx);
 
+    // <NT> 以multi-stage为例，将会调用 include/cutlass/gemm/threadblock/mma_multistage.h 的 MmaMultistage::operator()
     // Perform this tile's range of multiply-accumulate (MAC) iterations
     mma(tile_work.k_iters_remaining, accumulator_tile, iterator_A, iterator_B, accumulator_tile);
 
@@ -1017,6 +1054,8 @@ protected:
     // Initialize tile work descriptor
     TileWorkDesc tile_work;
 
+    // <NT> dp: Data-Parallel, 一次就把一个输出 tile 的 K 维全部跑完，直接写回全局 C
+    //      sk: Stream-K, 只跑 K 维的一小段，把部分和写到全局 workspace，后续再由其它 SK/DP block 归约.
     bool dp_block = (block_idx >= dp_start_block_idx) && (block_idx < reduce_start_block_idx);
     bool sk_block = (block_idx < sk_padding_start_block_idx);
     bool reduce_block = (block_idx >= reduce_start_block_idx) &&
@@ -1070,6 +1109,7 @@ protected:
         separate_reduction(reduce_block_idx);
       }
 
+      // <NT> 不在dp或sk block 范围内的线程不需要参与后续计算，可以直接退出。
       return;
     }
 
@@ -1078,6 +1118,7 @@ protected:
     while (true)
     {
       // Perform this block's share of work for this tile
+      // <NT> 核心计算部分
       process_tile(
         tile_work,
         block_idx,

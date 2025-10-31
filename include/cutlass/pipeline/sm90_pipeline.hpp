@@ -43,6 +43,87 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/detail/dependent_false.hpp"
 
+// <NT>M pipeline导读
+// sm90的pipeline类型有以下4种，均按stage划分：
+// * PipelineTmaAsync         | g->s   | cp.async.bulk.tensor，纯 TMA 异步加载 设计的，硬件自动commit，常用于 mainloop加载A/Btile 以及 Cluster内多block广播。
+// * PipelineTmaStore         | s/r->g | cp.async.bulk.store，只有 producer，没有 consumer wait，TMA 硬件把数据写回 global 后自动释放资源。
+// * PipelineTransactionAsync | g->s   | 通用型、软件显式 arrive、stage 精确匹配 的流水线，适用于 epilogue 加载 C/D 或任何非 TMA 的 producer-consumer 场景，
+//                                       需用户手动commit。cluster广播也需要手动指定。本身并不绑定任何特定传输指令——它只负责“软件端 arrive/wait”同步，由用户决定使用什么指令，如：
+//                                       1) cp.async.bulk.tensor (TMA load)    2) cp.async.bulk.store (TMA store)
+//                                       3) 普通 ld.global + st.shared          4)甚至寄存器 → shared 的 st.shared                
+// * PipelineAsync            | g->s   | 等于 PipelineTransactionAsync 去掉“事务字节”逻辑，更通用、更薄。不替你发 TMA，不替你算字节数，
+//                                       acquire → 搬数据 → commit → wait → release，其余全靠用户代码。典型场景是 非 TMA 的 double-buffer 流水，或 用户想完全掌控 arrive 时机。
+//
+// 分别对应使用tma的bulk和使用普通的cp.async, 两个类型都带有Stages_参数，可分多阶流水处理，高效重叠数据加载和计算。
+// 消费者需要判断数据是否准备好，生产者需要判断消费者数据是否使用完成，底层会通过barrier来完成。
+//
+// 在sm90之前，并没有pipeline，使用cp.async这种异步指令需要手写cp.async.commit/wait。sm90后有封装的pipeline，可以直接用pipeline的arrive和wait函数.
+// 
+// api分两类：
+//  1) 生产者api: producer_try_acquire / producer_acquire / producer_commit / producer_tail / producer_get_barrier / producer_expect_transaction
+//  2) 消费者api: consumer_try_wait / consumer_test_wait / consumer_wait / consumer_release
+// 关键变量：
+//  1）full_barrier_ptr_ / empty_barrier_ptr_: 两类api围绕这两个变量进行操作，内存由SharedStorage持有。
+//     SharedStorage会在pipeline以外的地方，基于smem进行创建。
+// 参数Params:
+//  1) is_leader: 通常取warpgroup(tma)/warp(cp.async)里面的第0号线程, transaction相关api会由is_leader线程执行，其他线程共享。
+//  2）role：一般取ThreadCategory::Producer / Consumer，如将0号warpgroup设为Producer，则里面所有线程的role都设置为Producer. 类似Consumer也一样。
+//  3）num_producers: producer的线程总数，即充当producer的warpgroup数量*每个warpgroup的线程数
+//  4) num_consumers: consumer的线程总数
+//  5）transaction_bytes: 一次tma传输涉及到的字节数
+//  6）initializing_warp: 常用默认值0，即使用0号warp作为代表去做初始化
+// barrier类型：见 include/cutlass/arch/barrier.h
+//  1) ClusterTransactionBarrier / ClusterBarrier 
+//
+//
+// <NT> PipelineState介绍
+//   一个极简的“流水线状态机”，把Pipeline中最关心的三件事：当前在跑哪一级（stage）、当前处于哪一相位（phase）、已经跑了多少次迭代（count）
+// 打包成一个16B的POD对象，包含以下三个变量，均放在寄存器里，没有smem的访问：
+//   static constexpr uint32_t Stages = Stages_;   // 编译期常量，流水线级数
+//   int      index_ = 0;   // 当前 stage 编号  [0 … Stages-1]
+//   uint32_t phase_ = 0;   // 相位 bit，0/1 交替，用来区分“偶/奇”轮次，
+//                          // 如同一块 buffer 在偶数相位由 producer 写入，奇数相位由 consumer 读取，反之亦然。
+//   uint32_t count_ = 0;   // 已完成的迭代总数，调试用，也可做断言
+// 核心函数：
+//   1) operator++：index_和count_自加1；当index_ == Stages时，说明跑过一圈了，index_复位0，phase_ ^= 1 相位翻转。
+//   2) operator+=/advance：与上面跳一步对应，这里一次跳 n 步
+//   3) make_producer_start_state: 给producer端创建 index_=0, phase_=1, count_=0 的初始状态。
+//         因为初始时 buffer 是空的，因此 producer 要比 consumer 提前半个周期，
+//         即producer 起步相位 = 1，consumer 起步相位 = 0。
+//
+//
+// <NT> OrderedSequenceBarrier 有序序列屏障介绍
+//   为 SM90+ 流水线设计，同一 stage 内按固定顺序 N→0→1→2→…→N-1→0 依次 arrive/wait，保证 producer i 永远先于 producer i+1 离开当前 stage，
+// 从而消除乱序竞争、简化指针切换逻辑。 
+//   SequenceDepth_: pipeline 深度（双缓冲/三缓冲段数）,对应着stage总数
+//   SequenceLength_: 同一深度内共有多少个“顺序参与者”（如 warp 数）
+//   barrier_ptr_[depth * Length + group_id]: 每个深度和每个长度都有一个barrier，类型是ClusterBarrier
+//   * 为什么明明是用于warp的不同角色，为什么用ClusterBarrier？
+//   --因为 OrderedSequenceBarrier 可能需要跨cta的屏障，Hopper级kernel经常把一个 warp 当成一个“producer/consumer”单元，然后把同一个 warp映射到不同的 thread block 上。
+//     cluster = {4,1,1}，每个 cluster 有 4 个 block，每个 block 只有 1 个 warp，这样 warp-0 在 block-0，warp-1 在 block-1，但它们仍然要 严格交替 load。
+//     此时 block-local barrier 已经不够用，必须能用 cluster-scope 的 barrier 才行。 一次性解决了“单 block”和“多 block cluster”两种场景”，代码无需 if-else。
+//
+// 用例：
+//   for (int stage = 0; stage < Depth; ++stage) {
+//     ordered_barrier.wait();          // 1. 等上一圈同组伙伴 arrive
+//     compute_or_copy();               // 2. 干活
+//     ordered_barrier.arrive();        // 3. 给下一组发 arrive，自带 ++stage_
+//   }
+//   wait() -> 对本组做 wait(phase)，保证前一周期同组已到达. barrier_ptr_[stage_.index() * Length + params.group_id]
+//   arrive() -> 对下一组做 arrive()，顺序固定，不会乱抢. barrier_ptr_[stage_.index() * Length + (group_id+1)%Length]
+//   stage_：PipelineState<Depth>，自带相位位，自动翻转相位进入下一深度，深度SequenceDepth_即是stage的总数。
+//
+// 深度Depth和长度Length可以理解为 Depth 行 × Length 列 的 二维屏障表，一行 = 一个 pipeline 段（stage），一列 = 一个 顺序小组（group）。
+// 同一行内：必须 按列号 0 → 1 → 2 → … → Length-1 依次 wait/arrive（顺序接力）。 一行全部列完成后，才整体推进到下一行（stage_++ 并取模 Depth）。
+// 循环往复，形成 “横向顺序、纵向循环” 的 二维保序流水线。
+//
+// 深度（Depth）	无依赖,	每行对应 不同缓冲段（A/B/C 段），数据地址独立,可并行
+// 长度（Length）	有顺序依赖,	同一段内 下一列要等上一列 arrive 才能开始, 必须顺序
+//
+// 使用时只用wait和arrive，如何对应到深度和长度？TODO?
+//
+// 三个大类的关系：如PipelineTmaAsync 是 TMA-bulk 的高阶“arrive/wait”外壳，内部用 PipelineState 做索引, OrderedSequenceBarrier 是可选的“顺序锁”，
+//                三者层级递减，后两个常被框架隐藏，用户只需 arrive()/wait()。
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass {
@@ -86,6 +167,10 @@ void pipeline_check_is_consumer(ThreadCategory role) {
   #endif
 }
 
+// <NT> 用于在单个 warp 中确定哪些线程是信号线程signaling_thread，
+// 这里32/16，即每2个线程中会有一个信号线程，而信号线程用于在多个线程之间进行同步、传递信号或协调工作。
+// 这里将这32个线程映射到 4x4 的网格layout中，即对应有4x4个dst_blockid，则每2个线程会协同处理一个block。
+// 协同处理一个block的两个线程中，会有一个线程是信号线程。
 CUTLASS_DEVICE
 cute::tuple<bool, uint32_t> spread_arrivals_to_warp(int thread_idx_in_warp) {
   constexpr uint32_t MaxClusterSize = 16;
@@ -96,7 +181,9 @@ cute::tuple<bool, uint32_t> spread_arrivals_to_warp(int thread_idx_in_warp) {
   uint32_t dst_blockid = layout(thread_row, thread_col);
   return cute::make_tuple(is_signaling_thread, dst_blockid);
 }
-
+// <NT> 用于在 warpgroup 中确定哪些线程是信号线程，并将线程映射到 4x4 的网格layout中。
+// 一个warpgroup是4个warp共128个线程，128/16=8，所以每8个线程会有一个信号线程。
+// 同理，4*32=128个线程对应4*4=16个块，每128/16=8个线程协同处理一个块，且这8个线程中会有1个是信号线程。
 CUTLASS_DEVICE
 cute::tuple<bool, uint32_t> spread_arrivals_to_warpgroup(int thread_idx_in_warpgroup, int warp_idx) {
   constexpr uint32_t MaxClusterSize = 16;
@@ -515,6 +602,8 @@ private:
     if (params_.is_leader) {
       full_barrier_ptr_[stage].arrive_and_expect_tx(params_.transaction_bytes);
     }
+
+    // <NT> brkpt指令会触发一个异常，中断当前的执行流程，调试器可以捕获这个异常，并允许开发者检查程序的状态、寄存器的值以及内存的内容
     #ifndef NDEBUG
     if (params_.role == ThreadCategory::Consumer || params_.role == ThreadCategory::NonParticipant) {
       asm volatile ("brkpt;\n" ::);
