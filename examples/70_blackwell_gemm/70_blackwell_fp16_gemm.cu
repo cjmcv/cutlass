@@ -54,6 +54,10 @@
     Usage:
       $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm --m=8192 --n=8192 --k=8192
 */
+
+// <NT> blackwell架构: SM100 (专业卡B200) / SM103 (专业卡B300-代号未销) / SM120 (消费级显卡如rtx5090)
+// example中单独以blackwell前缀的都用于SM100，而用于SM120的会带有geforce字样，用于SM103的则直接标记了SM103.      
+//
 // <NT> Blackwell（sm100a）新特性摘要
 // 1) 新增了一整套 Tensor Core MMA 指令（tcgen05），其吞吐量是 Hopper Tensor Core MMA 指令（WGMMA）的两倍。
 //   注意：WGMMA 指令在 Blackwell 上无法兼容。(参考 https://docs.nvidia.com/cuda/parallel-thread-execution)
