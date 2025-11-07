@@ -137,6 +137,24 @@ using namespace detail;
 //        1) 同步的sts;
 //        2) 同步的stmatrix (即是stsm, 与ldmatrix对应，但是从hopper才开始支持，可将mma/wmma/wgmma的数据回存到smem；
 //                           注：wgmma仅是输入的AB矩阵可以从smem直接取数，但是输出矩阵C仍然是在reg的, 因此仍然需要有配套r2s的操作)
+// 
+// <NT> 数据布局定义，如行优先 / 列优先 / m-major(n-major) / k-major
+//  内存布局顺序（哪个维度在内存中连续）：
+//    1）行优先：row-major，一行里的数据连续存储，如A[M,K]，M为行，K为列。同一 M 维度下，K0K1K2K3K4连续存放。
+//    2）列优先：colom-major，一列里的数据连续存储，如B[K,N], K为行，N位列。同一 N 维度下，K0K1K2K3K4连续存放，即相当于B[N,K].
+//  访问模式顺序（哪个维度先遍历）：
+//    1）M优先：m-major，m步长为1，如A[M,K]，则有 M0M1M2M3M4 连续存放.
+//    2）K优先: k-major，k步长为1，如A[M,K]，则有 K0K1K2K3K4 连续存放.
+//    
+//  k-major例子说明： 
+//    1）出自 auto dA = make_stride(ldA, Int<1>{});                            // (dM, dK)
+//           auto sA = make_layout(make_shape(bM,bK), LayoutRight{});   // (m,k) -> smem_idx; k-major
+//    2）tools/library/src/sparse_gemm_operation_3x.hpp，有以下注释的原话，说明稀疏矩阵的限制条件：
+//         “The tensor must be densely packed.  That is, lda is k if the tensor is k-major,
+//         and lda is m if the tensor is m-major.” 
+//       反映出正常dense矩阵，lda==k，即为k-major，同一m下k维度数据连续，m进1则内存跨k个元素。
+//       所以正常的RCR的gemm布局，对应的就是k-major / k-major / n-major
+
 
 template <
   int Stages,

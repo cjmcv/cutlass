@@ -29,6 +29,26 @@
  *
  **************************************************************************************************/
 
+// <NT> Blackwell MOE example 介绍
+//
+// 对比 75_blackwell_grouped_gemm/75_blackwell_grouped_gemm.cu 例子的区别
+//  75_blackwell_grouped_gemm: 典型分组gemm，m/n/k都很大且都可能不同，趋于计算密集型。
+//    权重B和激活值A都采用TMA Load； 
+//    该例子重点展示Blackwell 支持在 device 端改 TMA desc，于是 grouped GEMM 可以完全动态尺寸且零 host 介入。
+//  92_blackwell_moe_gemm: 针对moe的分组gemm，m可以非常大，但是n很小(4~32)，k中等。因为n很小，整体趋于访存密集型。
+//    权重B采用TMA Load，但激活A采用cpasync；
+//    该例子重点展示当 N 极小、token 数频繁变化时，别用 TMA 搬激活，用 CPASYNC 可以把 desc 更新开销彻底省掉，而权重仍走 TMA。
+//
+//  为什么普通grouped_gemm的激活采用TMA, MOE的grouped_gemm的激活采用cpasync替代tma？
+//  -- 非moe的普通grouped_gemm中，类似linear层，推理框架会将几十个请求打包成一个batch，对应着A矩阵的M，一般会持续一段时间。
+//     如请求数一直很多，M会保持为最大batch_size，如没有新请求，M也会持续一段时间，直到有seq退出，m才减小。
+//     总之，一个m值一般都会持续用到多次计算中，A的shape变化频次较少。
+//     同时，普通场景MNK大多都比较，多为计算密集，tma的带宽红利完全能掩盖占比小的 tma desc 更新开销，并取得收益。
+//  -- moe的grouped_gemm中，每生成一个 token 后，router 立即把新 token 重新打散到 8/16/32 个专家，
+//     下一步的「专家-批次」完全重排，旧 M 列表彻底失效，descriptor 无复用机会，每次都要现场重写。
+//     此外，因为N = 4~32很小，为访存密集，计算强度低，descriptor更新耗时比重大，直接吃掉全部带宽红利。
+//     所以改用cpasync可以将 descriptor 更新完全省掉，虽然带宽利用率比TMA略降，但总时间更短。
+
 /*! \file
   \brief Example of Blackwell MoE-style grouped GEMM implementation using TMA to load A and CPASYNC to load B.
 

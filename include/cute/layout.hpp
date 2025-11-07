@@ -678,6 +678,7 @@ coshape(Layout<Shape,Stride> const& layout)
   return transform_leaf(co_coord, [](auto c) { return c + Int<1>{}; });
 }
 
+// <NT> cosize 给出该 Layout 所需的元素总个数.
 // Return the codomain size of a mode
 // @return M smallest integer such that
 //           size(@a sub_layout(c)) < M for all c < size(@a sub_layout)

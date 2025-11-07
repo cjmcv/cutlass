@@ -88,11 +88,11 @@ namespace cutlass {
 // 2）对每个[1,128]的原权重矩阵，取出其scale和zero，逐个元素先减去zero后除以scale，再乘以7放大到[-7,7]，即可完成整个量化计算。quant = round((w128 - zero) / scale * 7)
 //
 // <NT> blockwise / groupwise / channelwise / tokenwise / tensorwise 的区别
-// blockwise 常取[128,128]为一组，scale维度是[N//128, K//128]，同时针对N和K维度。
-// groupwise 常取[1,128]为一组，scale维度是[N, K//128]，针对K维度。
-// channelwise 以整个输出channel为一组，即一个N的所有K为一组，所以scale维度是[N, 1]
-// tokenwise 以一个token为一组，针对输入A矩阵[M,K], 即一个M的所有K为一组，所以scale维度是[M, 1]
-// tensorwise 是整个tensor为一组，即scale只有一个值。layerwise同tensorwise。
+//  blockwise 常取[128,128]为一组，scale维度是[N//128, K//128]，同时针对N和K维度。
+//  groupwise 常取[1,128]为一组，scale维度是[N, K//128]，针对K维度。
+//  channelwise 以整个输出channel为一组，即一个N的所有K为一组，所以scale维度是[N, 1]
+//  tokenwise 以一个token为一组，针对输入A矩阵[M,K], 即一个M的所有K为一组，所以scale维度是[M, 1]
+//  tensorwise 是整个tensor为一组，即scale只有一个值。layerwise同tensorwise。
 
 template <
   class QuantizedElement,
@@ -413,8 +413,8 @@ struct UnderlyingElement<T, cute::void_t<typename T::Element>> {
 //
 // <NT> w4a16中权重reordering的背景原因
 //    hopper架构中gemm的数据会使用tma从gmem搬运数据到smem，并自动完成swizzle以适应wgmma的格式要求，wgmma可以直接从smem中读取数据进行计算。
-//  但tma不支持4位的操作，且wgmma的实际计算精度是16位。因此需要把4位的权重数据当作是8位的，再使用tma搬运数据到smem，再从smem上读取数据到寄存器，手动完成int4到bf16的解包，
-//  并根据wgmma要求的swizzle排布，将数据写回到smem，才交给wgmma计算。所以这个过程就涉及到了在线解包和在线排序的操作，其中的解包无法离线完成，但顺序的排布可以。
+//  但tma不支持4位的操作，且wgmma的实际计算精度是16位。因此需要把4位的权重数据当作是8位的，再使用no-swizzle tma搬运数据到smem，再从smem上读取数据到寄存器，手动完成int4到bf16的解包，
+//  并根据wgmma要求的swizzle排布，由寄存器交给wgmma计算。所以这个过程就涉及到了在线解包和在线排序的操作，其中的解包无法离线完成，但顺序的排布可以。
 //    使用 compute_memory_reordering_atom 离线把 int4 字节顺序 预排好，顺序即为wgmma所需的顺序，在线只需要按顺序从smem读取到寄存器做反量化解包，
 //  然后按compute_memory_reordering_atom得到的layout_atom写回到smem，再外加一层运行时 swizzle 地址计算即可交由wgmma直接计算。
 //   --------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -429,6 +429,7 @@ struct UnderlyingElement<T, cute::void_t<typename T::Element>> {
 //  补充知识: 最终swizzle 地址为什么一定要运行时进行？
 //       答：hopper的swizzle 的本质是“硬件地址线 XOR”，而 XOR 输入里包含只有运行时才知道的物理行号；
 //           离线永远不可能预知这些位，因此最终 XOR 必须、也只能由硬件在运行时完成。
+//
 //
 // <NT> sub bank冲突 与 bank 冲突
 //   回顾bank 冲突定义：一个 32-bank 共享内存，bank宽度 4 字节 (128 bit), 如果 warp 的 32 个线程同时访问 
@@ -445,6 +446,66 @@ struct UnderlyingElement<T, cute::void_t<typename T::Element>> {
 //   避免冲突：1）让同一 warp 的线程访问不同 bank：一个warp不同线程访问同一个 bank 的不同地址，会造成bank冲突。
 //            2）让相邻线程访问不同 sub-bank：如每线程读取0.5B，两个0.5B处于同一个subbank，两个线程同时访问同一个subbank，即会存在subbank冲突。
 //                                   对数据做shuffle，使其交错，即可避免subbank冲突
+//
+//
+// <NT> machete kernel 对比 cutlass compute_memory_reordering_atom + reorder_tensor
+// machete kernel实现：https://github.com/vllm-project/vllm/tree/18961c5ea62976efc50525b72e40337993c5e4f9/csrc/quantization/machete
+// machete kernel实现链路大多与cutlass原版一致，主要在权重重排这块做了些工作。
+// * reorder颗粒度：
+//       cutlass原版的重排操作围绕MMA进行，只固定一个atom的TV-offset的映射，最小可加载单元为 64×32 元素.
+//       machete却是直接围绕MMA的打包块进行，颗粒度更大，最小可加载单元变为 128×64 元素。
+//              因为mma组合在权重重排时就已固定，所以计算时也应与之对应，无法做到cutlass那样可以自由组合。
+// * 交叉排布格式：
+//       cutlass交错方式为线程内8元向量交错；[02461357]
+//       machete交错方式为线程内4元+跨线程的2x2分块交错；[]
+// 好处：打包粒度更大，TMA带宽利用率更高；固定的交错方式可以直接和prmt指令对应，一一对应，1 条 prmt解完，寄存器压力更小。
+//      即固化一些参数配置，将更多运行时操作放到了离线进行，达到减轻运行时负担的效果。
+//      限制条件：M需要大，否则在固定开销比重很大的情况下，收益优势可忽略。
+// 缺点：kernel 可调参数空间被mma组合shape，brick 形状、prmt 解码路径锁死，可tuning参数减少，bad case出现概率加大。
+//
+//
+// <NT> cutlass hopper w4a16 对比 marlin (amphere_q4) 在h20上的数据
+//                        1      2      4       8      16      32      64      128     256      512     1024    2048      4096     8192    16384
+//  torch_bf16       = [0.377, 0.780, 1.575,  3.130,  6.255, 12.340, 23.362, 39.492, 60.583,  82.915, 102.774, 117.797, 121.772, 128.134, 133.108]
+//  xop_hopper_bf16  = [0.559, 1.123, 2.251,  4.473,  9.107, 18.127, 36.341, 72.609, 93.666, 103.382, 125.062, 127.589, 135.107, 136.883, 137.246]
+//  xop_amphere_bf16 = [0.915, 1.961, 3.969,  7.824, 14.708, 29.074, 43.534, 55.963, 72.289,  78.052,  83.842,  88.151,  91.327,  91.808,  92.549]
+//  xop_hopper_q4    = [1.002, 2.046, 4.081,  8.156, 15.621, 32.861, 60.088, 79.306, 98.184, 116.035, 123.832, 132.092, 132.001, 138.782, 139.046]
+//  xop_amphere_q4   = [1.427, 3.157, 6.196, 12.496, 24.786, 34.405, 46.321, 65.270, 76.960,  82.739,  85.982,  86.099,  86.070,  86.243,  86.245]
+// 数据总结：1）amphere_q4在m<32时，优于hopper_q4。
+//          2）amphere_q4收益范围很窄，在m=40+即被反超，大m下仅达峰值性能的58%。
+//          3）hopper_q4相比于bf16，收益范围很广。在m=128时相近，m很大时也能保持与bf16相近甚至优于bf16，可达理论峰值的94%.
+// 分析：1）hopper_q4把TMA/WGMMA/WS都用上了，为什么小m (M<=32) 反而比下 amphere_q4 慢不少？
+//       -- hopper 的 wgmma 指令本身 最小计算块就是 M64, 见 include/cute/arch/mma_sm90_gmma.hpp
+//          而amphere的 mma 指令本身 最小计算块就是 M16, 见 include/cute/arch/mma_sm80.hpp
+//          因此m大于16时，mma即可打满一个warp，而wgmma需要m大于64，才能打满一个warpgroup，凑不足的部分会被硬件 mask 掉，造成浪费。
+//          tile 粒度小、启动延迟低、mask 浪费少，就能 更早结束、释放带宽资源。
+//       -- TMA启动开销大，且数据量太小打不满带宽，启动开销比例大。而cpasync虽然在数据量充足时带宽利用率比TMA低，
+//          但本身小m下大家都打不满，且cpasync粒度小，启动开销小，明显占优。
+//       -- warp specialize的同步开销比重大 且 负载不均，流水线充不满。
+//       !!! 同理，hopper架构的小m下，普通gemm也应换成amphere kernel，而不要采用hopper kernel。
+//           ==> h20 上实测，m为1-64均能获得收益。
+//      2）amphere_q4 在大m下，因反量化比重增大，导致性能比bf16要差不少
+//         为什么 hopper_q4 在大m下，反量化占比大，但性能却不会下降，返而跟与bf16持平？
+//       -- 1. 
+
+
+//       -- 1. wgmma指令本身可带scale，可搜 “GMMA 64x256x16 F32+=BF16*BF16”。但不支持group-wise
+//             而amphere的mma指令, 没端口又没广播 bus，反量化只能走 FFMA 串行，使用cuda core；
+//          2. TMA一次搬 8 KB 权重+256 B scale 直接进 寄存器文件, 相比 BF16 的 shared-memory 双缓冲 省 2 次 2 TB/s 量级来回, DRAM 带宽利用率大幅提高（H20上30%-40%？）
+//             (对于大m的计算密集型不适用，但也可延长收益范围) 
+//          3. TMA寄存器直连：权重+scale 一次 8 KB 直接进寄存器文件，bypass shared memory，比 BF16 少 2 次 2 TB/s 寄存器 <=> shared 来回，省 6-8 % 周期。（即rs模式）
+//
+//       -- 补充上面第1点：wgmma 和 mma 的 Pipeline 深度有差别。
+//         wgmma的bf16最大一次可算 M64×N256×K16 (K16是因为16×2B=32B, 正好满足TensorCore最小搬运粒度32B).
+//         1 warp-group 发射，k16 被硬拆成 16 个节拍（每拍 K=1），pipeline 深度就是 16 级，对应 16-cycle 分片的pipeline (只有warp group的mma才有这个说法)。
+//         而sm80 mma是 1 warp 发射，内部 1-cycle 算完毕，虽然存在m16n8k16指令，但 k16 只是 寄存器打包宽度，硬件不再分片。（amphere不分片，只有hopper之后才分）
+//         i: 为什么 16 分片能隐藏反量化
+//         -- 一条 wgmma.mma_async.m64n256k16 需要16个cycle完成，K=16 切成 16 份，每 1 个 cycle 推进一份。
+//            反量化被塞在哪里第 0 级 由 Tensor Core 内部的 broadcast unit 完成
+//            int4 × scale → fp16 只占 1 级节拍，第 1~15 级 就是 纯 FMA 累加，不再碰 scale。
+//            对比 Ampere mma 1 cycle 就 retire，如果也加 1 cycle 反量化 → 总 latency 变成 2 cycle，100% 暴露。Ampere 没有这么多后台节拍，就藏不住。
+//            multi-stage 只是 把 memory→register 的延迟拆成多拍，ALU 指令依旧要排队，反量化这条 fma 躲不掉。
+
 
 // Given a type of MMA instruction, compute a memory reordering atom that places all values
 // owned by each thread in contiguous memory locations. This improves smem load vectorization,

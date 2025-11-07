@@ -464,6 +464,11 @@ struct CollectiveMma<
     return cute::make_tuple(gA_mkl, gB_nkl, mSFA_mkl, mSFB_nkl);
   }
 
+  // <NT> sA/sB中的s是smem的意思，对应存放到smem的A和B矩阵的tile，会使用tma来完成gmem到smem的数据加载；
+  // sSFA/sSFB则对应A和B的ScaleFactor，会根据数据量由 IsTmaLoadSFA / IsTmaLoadSFB判断选择是否也使用tma；
+  // 如果scale也使用tma，会在该load函数里一起加载，如果不使用tma，则会单独放到load_auxiliary中使用cp.async来加载scale。
+  // 很多时候因为scale数据量少，使用cp.async可以更灵活，且与tma可以并行执行，也避免浪费tma，加快AB矩阵的加载。
+  
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Producer Perspective
   template <
@@ -482,13 +487,8 @@ struct CollectiveMma<
       int thread_idx,
       uint32_t block_rank_in_cluster,
       TensorStorage& shared_tensors) {
-    // <NT> lane_predicate表示当前线程是否被选取出，true为是false为否。
-    // 一个warp里只需要一个线程调用具体拷贝指令，warp的其他线程会自动协同工作，不需要重复调用指令。
-    // 
-    // sA/sB中的s是smem的意思，对应存放到smem的A和B矩阵的tile，会使用tma来完成gmem到smem的数据加载；
-    // sSFA/sSFB则对应A和B的ScaleFactor，会根据数据量由 IsTmaLoadSFA / IsTmaLoadSFB判断选择是否也使用tma；
-    // 如果scale也使用tma，会在该load函数里一起加载，如果不使用tma，则会单独放到load_auxiliary中使用cp.async来加载scale。
-    // 很多时候因为scale数据量少，使用cp.async可以更灵活，且与tma可以并行执行，也避免浪费tma，加快AB矩阵的加载。
+
+
     //
     int lane_predicate = cute::elect_one_sync();
     // Blockscaling: Tma loads for load_input and CpAsync for load_scale
@@ -523,8 +523,6 @@ struct CollectiveMma<
       mSFB_nkl, make_tile(Int<ScaleNsPerTile>{}, Int<1>{}),
       make_coord(n_coord,_,l_coord));
 
-    // <NT> S是src，D是dst，基于block_tma_a将数据分块，表示后续会将数据从tAgA搬运到tAsA。
-    // A和B直接使用tma，scaleA和scaleB会按数据量判断是否使用tma，如使用，其才做与AB的加载类似。
     // Applies the mapping from block_tma_a
     Tensor tAgA = block_tma_a.partition_S(gA);                                                 // (TMA,TMA_M,TMA_K,k)
     Tensor tAsA = block_tma_a.partition_D(sA);                                                 // (TMA,TMA_M,TMA_K,PIPE)
@@ -559,9 +557,6 @@ struct CollectiveMma<
     uint16_t mcast_mask_b = 0;
     uint16_t mcast_mask_sf = 0;
 
-    // <NT> 如果采用了multicast的策略，则需要准备tma的multicast用的掩码，指示哪个线程块需要接收数据；
-    // size<0>(block_layout)是cluster里一列有多少个线程块， size<1>(block_layout)是cluster里一行有多少个线程块，
-    // 先遍历线程块布局的每一列，取出行为cluster_local_block_id.x列为n映射得到的block_id, 生成一个掩码位。
     // Issue TmaLoads for GEMM operands A/B and CpAsync for scale tensors
     // Maps the tile -> block, value
     if constexpr (cute::is_same_v<GmemTiledCopyA, SM90_TMA_LOAD_MULTICAST>) {
@@ -577,14 +572,7 @@ struct CollectiveMma<
         mcast_mask_b |= (uint16_t(1) << block_layout(m,cluster_local_block_id.y,Int<0>{}));
       }
     }
-
-    // <NT> 按k方向分块, 使用tma从gmem加载数据到smem。
-    // pipeline是MainloopPipeline类型，内嵌mbarrier指令，实现生产者消费者的栅栏管理。
-    // 在load           调用 pipeline.producer_acquire / producer_get_barrier
-    //   load_auxiliary 调用 producer_acquire / producer_commit
-    //   load_tail      调用 producer_tail
-    // 在mma调用 pipeline.consumer_try_wait / consumer_wait / consumer_release.
-    //   
+  
     // Mainloop
     CUTLASS_PRAGMA_NO_UNROLL
     for ( ; k_tile_count > 0; --k_tile_count) {
@@ -829,9 +817,6 @@ struct CollectiveMma<
                   size<0>(typename TiledMma::BLayout{}) == NumThreadsPerWarpGroup,
                   "Stride of the first mode must be 0 and the size of the mode must be NumThreadsPerWarpGroup");
 
-    // <NT> TiledMma通常与ClusterShape强关联，TiledMMA在ClusterShape定义的cluster上执行计算，TiledMMA里的元素是线程。
-    // 一个warp组有128个线程，MmaWarpGroups看一个TileMMA里共有多少个warp组，以组的数量充当行，一组的128个线程充当列，得到warp_group_thread_layout。
-    // 按warp group取出thread_mma，表示为当前线程要计算的部分。
     constexpr int MmaWarpGroups = size(TiledMma{}) / NumThreadsPerWarpGroup;
     Layout warp_group_thread_layout = make_layout(Int<MmaWarpGroups>{},
                                                   Int<NumThreadsPerWarpGroup>{});

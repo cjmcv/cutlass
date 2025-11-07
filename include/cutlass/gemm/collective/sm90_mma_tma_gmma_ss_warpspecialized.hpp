@@ -79,7 +79,29 @@
 // device充当最外层封装，存放在device文件夹下，通过调用kernel的相关函数，完成计算。
 // include/cutlass/gemm/device/gemm_universal.h
 // 关系是 device => kernel => collective mainloop + collective epilogue
-
+//
+// <NT> rs和ss的区别: 以 sm90_mma_tma_gmma_rs_warpspecialized 和 sm90_mma_tma_gmma_ss_warpspecialized 为例
+// rs和ss表示着GMMA 的 A-operand 从哪儿来：r对应rf，s对应smem。
+// | 阶段         | RS 行为                                     | SS 行为                        |
+// | ----------- | ------------------------------------------- | ------------------------------ |
+// | Producer    | TMA 把 A/B 搬到 Shared Memory（同 SS）       | 同左                            |
+// | Consumer    | **额外做 smem→rmem 拷贝** → 寄存器片段 → GMMA | 直接 descriptor 绑定 GMMA，无拷贝|
+// | 寄存器压力   | 高（A-tile 占 RF）                           | 低（A-tile 只占 SMEM）          |
+// | 共享内存压力 | 低（A-tile 可立即覆盖）                       | 高（A/B 都要驻留）               |
+//
+// rs 适用于权重端位宽极低（W4A16、W8A16）且需要 反量化/查表 后再参与计算，反量化逻辑在 smem→rmem 拷贝时一并完成，寄存器里已是 FP16/BF16；
+//    1）4-bit 权重先由 TMA 搬进 shared memory（仍是 packed 格式）
+//    2）Consumer warps 用 ld.shared / ld.matrix 把 packed 数据 直接读到寄存器；
+//    3）同一条寄存器流水线里立刻做 反量化 / 查表 / unpack，得到 FP16/BF16 值；
+//    4）FP16/BF16 寄存器片段直接作为 wgmma 的 A-operand 使用，走 GMMA::RegisterIterator 路径，不需要写回到smem。
+// ss 是直接放 Shared Memory 就算，因为 Hopper 的 wgmma 指令可以直接把 smem 当作 源数据，只要满足：
+//    1）SMEM descriptor 路径； 2）数据布局符合 Tensor Core 的 swizzle 要求； 3）位宽合法，
+//    不需要任何 smem→rmem 的搬运阶段，wgmma 指令内部会直接通过 shared memory descriptor 读取 A-tile，与 B-tile（同样来自 SMEM）一起完成矩阵乘。
+// 
+// 补充问题：为什么 SM90 还在 kernel 名字里区分 *_rs_* / *_ss_*，而 SM100 的示例代码已经看不到这对后缀。
+//        -- wgmma 指令对两个 operand 的物理来源有硬连线限制，A 可以是寄存器（R）或共享内存描述符（S），B 只能是共享内存描述符（S）。
+//           在hopper的代码里，单独区分开来写，而blackwell的umma代码里，则把 “A operand 要从哪来” 的决定完全下沉到 一条模板主循环 里，
+//           4-bit → 内部走 RS（自动解包到寄存器）; 8-bit+ → 内部走 SS（直接用 SMEM-desc）.RS/SS 两条路径仍然物理存在，只是被封装在 TiledMma::make_fragment_A/B.
 namespace cutlass::gemm::collective {
 using namespace cute;
 
@@ -342,6 +364,10 @@ struct CollectiveMma<
   //          copy(mcast-a/b)
   //
   // multicast：
+  //    如果采用了multicast的策略，则需要准备tma的multicast用的掩码，指示哪个线程块需要接收数据；
+  // size<0>(block_layout)是cluster里一列有多少个线程块， size<1>(block_layout)是cluster里一行有多少个线程块，
+  // 先遍历线程块布局的每一列，取出行为cluster_local_block_id.x列为n映射得到的block_id, 生成一个掩码位。
+  // 
   //  1) 把 1-D 的 block_rank_in_cluster 映射到 2-D (m, n) 网格
   //     uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
   //  2) 生成 A 矩阵 mask（行广播）：固定当前行号 cluster_local_block_id.x，遍历 所有列号 n，把同一行的所有 block_id 置 1。
@@ -370,6 +396,10 @@ struct CollectiveMma<
   //  即A矩阵m相同则共享，B矩阵n相同则共享：
   //    block(m  ,n  ), block(m  ,n+1)   =>    A[m,0]/B[n,0]  ,  A[m,0]/B[n+1,0]
   //    block(m+1,n  ), block(m+1,n+1)   =>    A[m+1,0]/B[n,0],  A[m+1,0]/B[n+1,0]
+  //
+  // * lane_predicate 表示当前线程是否被选取出，true为是false为否。
+  // 一个warp里只需要一个线程调用具体拷贝指令，warp的其他线程会自动协同工作，不需要重复调用指令。
+  // 
 
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Producer Perspective
@@ -438,6 +468,12 @@ struct CollectiveMma<
         }
       }
 
+      // <NT> 按k方向分块, 使用tma从gmem加载数据到smem。
+      // pipeline是MainloopPipeline类型，内嵌mbarrier指令，实现生产者消费者的栅栏管理。
+      // 在load           调用 pipeline.producer_acquire / producer_get_barrier
+      //   load_auxiliary 调用 producer_acquire / producer_commit
+      //   load_tail      调用 producer_tail
+      // 在mma调用 pipeline.consumer_try_wait / consumer_wait / consumer_release.
       // Mainloop
       CUTLASS_PRAGMA_NO_UNROLL
       for ( ; k_tile_count > 0; --k_tile_count) {
@@ -497,6 +533,9 @@ struct CollectiveMma<
   //                     warpgroup_wait<K_PIPE_MMAS>() 保证 不会同时提交超过硬件上限。
   // 6）Prologue与mainloop阶段：见下面的注释笔记 <NT>S
   //
+  // <NT> TiledMma通常与ClusterShape强关联，TiledMMA在ClusterShape定义的cluster上执行计算，TiledMMA里的元素是线程。
+  // 一个warp组有128个线程, MmaWarpGroups 看一个TileMMA里共有多少个warp组，以组的数量充当行，一组的128个线程充当列，得到 warp_group_thread_layout
+  // 按warp group取出thread_mma，表示为当前线程要计算的部分。
 
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective

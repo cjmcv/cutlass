@@ -343,7 +343,12 @@ struct SparseMma;
 //              fp16 => 181 TFLOPS
 //              tf32 => 90.5 TFLOPS
 // 》》》hopper: https://www.nvidia.cn/lp/data-center/resources/download-hopper-arch-whitepaper/
-// 
+//             https://zhuanlan.zhihu.com/p/691287727
+// H20:           fp8 + fp32acc => 296 TFLOPS
+//          fp16/bf16 + fp32acc => 148 TFLOPS
+//                显存带宽 4.0 TB/s
+//                卡间带宽 900 GB/s
+//    
 // 》》》blackwell：https://images.nvidia.cn/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
 // RTX5090:       fp4 + fp32acc => 1676 TFLOPS  (没有int4？)
 //                   int8       => 838 TFLOPS 

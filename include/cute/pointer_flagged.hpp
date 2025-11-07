@@ -95,6 +95,20 @@ as_position_independent_swizzle_layout(ComposedLayout<SwizzleFn,smem_ptr_flag_bi
   return composition(recast_layout<uint8_t,uint_bit_t<B>>(layout.layout_a()), Int<0>{}, layout.layout_b());
 }
 
+// <NT> 把 已经由硬件实现的 swizzle 规则 从 “字节地址视角” 转换成 “元素类型视角”，好让 C++ 代码能用类型安全的 smem_ptr<T> 去访问；
+// 它本身并不实现 swizzle，也不给 TMA 增加 swizzle 能力。因此：
+// 对于 ≥8-bit 类型，如果 TMA 描述符里开了硬件 swizzle，调用这个函数后得到的张量视图就会让后续 ld.matrix / wgmma 自动享受硬件重排。
+// 对于 4-bit 类型，TMA 根本没有硬件 swizzle，函数同样会返回「无 swizzle」的视图——此时要靠软件在寄存器里手动解包，与函数无关。
+// 
+// 补充：只要 swizzle 函数对象是在 uint8_t*（或 void）上计算偏移，就是“字节地址视角”；
+//      当它被 recast 到 T* 并按 sizeof(T) 倍数去计算偏移时，就成了“元素类型视角”。
+//      如：
+//      | cute::make_swizzle<Swizzle<B,M,S>>{} 的默认模板参数              | 字节地址视角 | 内部所有偏移量以 byte 为单位                                 |
+//      | recast_layout<uint8_t, T>(swizzle)                              | 元素类型视角 | 把原 byte 偏移 ÷ `sizeof(T)`，得到元素粒度的偏移                |
+//      | as_position_independent_swizzle_tensor(smem_tensor) 返回的新张量 | 元素类型视角 | 里面已经做了上面的 recast，迭代器按 T 步进                        |
+//      | TMA 描述符里的 swizzle 模式（32 B/64 B/128 B）                   | 字节地址视角 | 硬件在 byte 地址线上做 XOR 重排，与类型无关                       |
+//      | 后续 `ld.matrix`/ `wgmma.desc` 真正访问内存                      | 元素类型视角 | 指令一次性读 16×FP16 或 8×BF16，但硬件仍按 byte-swizzle 去算物理地址 |
+
 template <class Tensor>
 CUTE_HOST_DEVICE
 auto

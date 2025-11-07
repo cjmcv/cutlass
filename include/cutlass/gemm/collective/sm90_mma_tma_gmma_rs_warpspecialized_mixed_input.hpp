@@ -53,6 +53,18 @@
 #include "cute/numeric/arithmetic_tuple.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+// <NT> MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput 介绍
+// 是CollectiveMma的偏特化实现，可用于w4a16/w4a8，会将w4权重解包并反量化为a16或a8类型, 然后进行a16/a8精度的计算。
+// 
+// * mma 函数: Consumer-warpgroup 的“解压+GEMM”引擎：把 4-bit 权重从 SMEM 搬进寄存器→当场反量化成 FP16→直接喂 wgmma，
+//             全程不回写 SMEM，流水并行，累加结果留在寄存器 accum 里。
+// * 问题：在常规GEMM中，权重会充当B矩阵，而这里的权重则一般充当A矩阵
+//      -- 为了让量化的4bit权重存放在 register-file 路径: A-operand → 寄存器 → 反量化 → GMMA ，解包和反量化直接在reg完成。
+//         未量化的16bit激活放在shared-memory 路径     : B-operand → shared memory → GMMA
+//         对于文件名 sm90_mma_tma_gmma_rs_warpspecialized_mixed_input 中的 rs，r在A矩阵，s在B矩阵。
+//
+// 相关笔记：1）w4权重reorder的细节：见 tools/util/include/cutlass/util/mixed_dtype_utils.hpp
+//          2）sm90的mainloop概况 / rs和ss的区别：见 sm90_mma_tma_gmma_ss_warpspecialized.hpp
 
 namespace cutlass::gemm::collective {
 using namespace cute;
@@ -747,6 +759,27 @@ public:
       pipeline.producer_tail(smem_pipe_write);
     }
   }
+
+  // <NT> MainloopSm90TmaGmmaRmemAWarpSpecializedMixedInput的 mma 函数介绍
+  //   mma在这里是 RS 路径（A 取自寄存器）的 Consumer-warpgroup 主循环核心，它把 4-bit 权重 tile 从 shared memory 搬到自己寄存器里，
+  // 当场解包 / 反量化成 FP16/BF16，再立即喂给 wgmma 做矩阵乘，整个过程流水线化、零回写。
+  // * copy-dequant流水线：
+  //    for K-tile 循环:
+  //       a. Utils::copy_tensors_MK(...) 把 packed 4-bit 从 tCsA 拷到 tCrA_copy_view（寄存器）
+  //       b. 立即 Utils::dequantize_A_kblock(...) 在寄存器里完成unpack → scale → (zero-point) → 输出 FP16 到 tCrA_mma
+  //       c. cute::gemm(tiled_mma, tCrA_mma, tCrB, accum) 把反量化后的 A 与 B 做 wgmma，结果累加到 accum
+  //       d. 预取下一个 K-block 的 packed 数据并提前反量化，隐藏 latency
+  // * as_position_independent_swizzle_tensor：基于 swizzle 规则 从 “字节地址视角” 转换成 “元素类型视角”，方便后面c++调用。
+  //    如支持硬件swizzle，调用该函数后，可以让后续 ld.matrix / wgmma 自动享受硬件重排。
+  // * unpack + 反量化权重的操作在 Utils::dequantize_A_kblock(tCrA_load, tCrA_mma, partitioned_extra_info, k_block);
+  //   在Consumer端的mma(..)函数中循环调用：
+  //    1）先把 4-bit packed 数据从 shared memory 拷到寄存器片段 tCrA_load（copy_tensors_MK 完成）；
+  //    2）紧接着就在寄存器里调用 dequantize_A_kblock，完成
+  //       – unpack（4-bit → 8/16-bit）
+  //       – scale（× scale）
+  //       – zero（? zero-point，若启用）
+  //       – layout 转换，
+  //       得到真正的 FP16/BF16 值，写入 tCrA_mma；后面的 cute::gemm 直接拿 tCrA_mma 当 A-operand 用。
 
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
