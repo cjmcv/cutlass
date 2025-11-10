@@ -464,47 +464,87 @@ struct UnderlyingElement<T, cute::void_t<typename T::Element>> {
 // 缺点：kernel 可调参数空间被mma组合shape，brick 形状、prmt 解码路径锁死，可tuning参数减少，bad case出现概率加大。
 //
 //
-// <NT> cutlass hopper w4a16 对比 marlin (amphere_q4) 在h20上的数据
+// <NT> cutlass hopper w4a16 对比 marlin (ampere_q4) 在h20上的数据
 //                        1      2      4       8      16      32      64      128     256      512     1024    2048      4096     8192    16384
 //  torch_bf16       = [0.377, 0.780, 1.575,  3.130,  6.255, 12.340, 23.362, 39.492, 60.583,  82.915, 102.774, 117.797, 121.772, 128.134, 133.108]
 //  xop_hopper_bf16  = [0.559, 1.123, 2.251,  4.473,  9.107, 18.127, 36.341, 72.609, 93.666, 103.382, 125.062, 127.589, 135.107, 136.883, 137.246]
-//  xop_amphere_bf16 = [0.915, 1.961, 3.969,  7.824, 14.708, 29.074, 43.534, 55.963, 72.289,  78.052,  83.842,  88.151,  91.327,  91.808,  92.549]
+//  xop_ampere_bf16 = [0.915, 1.961, 3.969,  7.824, 14.708, 29.074, 43.534, 55.963, 72.289,  78.052,  83.842,  88.151,  91.327,  91.808,  92.549]
 //  xop_hopper_q4    = [1.002, 2.046, 4.081,  8.156, 15.621, 32.861, 60.088, 79.306, 98.184, 116.035, 123.832, 132.092, 132.001, 138.782, 139.046]
-//  xop_amphere_q4   = [1.427, 3.157, 6.196, 12.496, 24.786, 34.405, 46.321, 65.270, 76.960,  82.739,  85.982,  86.099,  86.070,  86.243,  86.245]
-// 数据总结：1）amphere_q4在m<32时，优于hopper_q4。
-//          2）amphere_q4收益范围很窄，在m=40+即被反超，大m下仅达峰值性能的58%。
+//  xop_ampere_q4   = [1.427, 3.157, 6.196, 12.496, 24.786, 34.405, 46.321, 65.270, 76.960,  82.739,  85.982,  86.099,  86.070,  86.243,  86.245]
+// 数据总结：1）ampere_q4在m<32时，优于hopper_q4。
+//          2）ampere_q4收益范围很窄，在m=40+即被反超，大m下仅达峰值性能的58%。
 //          3）hopper_q4相比于bf16，收益范围很广。在m=128时相近，m很大时也能保持与bf16相近甚至优于bf16，可达理论峰值的94%.
-// 分析：1）hopper_q4把TMA/WGMMA/WS都用上了，为什么小m (M<=32) 反而比下 amphere_q4 慢不少？
+// 分析：1）hopper_q4把TMA/WGMMA/WS都用上了，为什么小m (M<=32) 反而比下 ampere_q4 慢不少？
 //       -- hopper 的 wgmma 指令本身 最小计算块就是 M64, 见 include/cute/arch/mma_sm90_gmma.hpp
-//          而amphere的 mma 指令本身 最小计算块就是 M16, 见 include/cute/arch/mma_sm80.hpp
+//          而ampere的 mma 指令本身 最小计算块就是 M16, 见 include/cute/arch/mma_sm80.hpp
 //          因此m大于16时，mma即可打满一个warp，而wgmma需要m大于64，才能打满一个warpgroup，凑不足的部分会被硬件 mask 掉，造成浪费。
 //          tile 粒度小、启动延迟低、mask 浪费少，就能 更早结束、释放带宽资源。
 //       -- TMA启动开销大，且数据量太小打不满带宽，启动开销比例大。而cpasync虽然在数据量充足时带宽利用率比TMA低，
 //          但本身小m下大家都打不满，且cpasync粒度小，启动开销小，明显占优。
 //       -- warp specialize的同步开销比重大 且 负载不均，流水线充不满。
-//       !!! 同理，hopper架构的小m下，普通gemm也应换成amphere kernel，而不要采用hopper kernel。
+//       !!! 同理，hopper架构的小m下，普通gemm也应换成ampere kernel，而不要采用hopper kernel。
 //           ==> h20 上实测，m为1-64均能获得收益。
-//      2）amphere_q4 在大m下，因反量化比重增大，导致性能比bf16要差不少
-//         为什么 hopper_q4 在大m下，反量化占比大，但性能却不会下降，返而跟与bf16持平？
-//       -- 1. 
-
-
-//       -- 1. wgmma指令本身可带scale，可搜 “GMMA 64x256x16 F32+=BF16*BF16”。但不支持group-wise
-//             而amphere的mma指令, 没端口又没广播 bus，反量化只能走 FFMA 串行，使用cuda core；
+//      2）NK=4096×4096，L40下 m > 256 就能接近理论峰值性能；H20下虽然算力被阉割，但带宽资源更充足，理论上更早摆脱访存瓶颈，却需要 M > 2048 才能接近峰值性能。
+//       -- 核心在于并行粒度不够，小m凑不出足够数量的 thread-block / warp / MMA 指令去同时占满所有单元。
+//          因为hopper gemm的峰值性能需要在wgmma/tma下实现，pipeline深度比L40要深很多，填满pipeline的难度更大，所以需要更大的m才能接近理论峰值。但Hopper也得益于它的深pipeline和大颗粒计算，
+//          使其峰值性能会更贴近理论峰值。L40 因为单 SM 算力高但带宽/缓存容量相对窄，后期往往被访存或 cache 容量轻轻拉住，实测峰值反而略低于理论值。
+//          Q: 既然不是因为访存受限导致的，为什么w4a16仍能起到很高的收益呢？
+//           -- 4bit可以一次性把 I-cache、L2、DRAM 带宽全部省下来，H20虽然4 TB/s HBM 吓人，但 L2 只有 50 MB，SM 共享内存只有 228 kB/SM，
+//             权重矩阵 4096×4096 FP16 = 32 MB，W4A16 后只剩 8 MB，一次 GEMM 就能把全部权重留在 L2，省掉 1-2 次 HBM 往返。
+//             省下来的 每字节都变成额外并行机会：同样带宽可 多送 2× tile 数据，occupancy 直接上涨 15-20 %。
+//           -- 字节少 → L2 命中率↑ → HBM 流量↓ → 功耗↓，core 频率可再抬 5-7 %，实测 Tensor 吞吐直接+8 %。
+//          Q: hopper的深pipeline体现在哪里?
+//           -- 从“指令发射”到“结果写回”之间，wgmma/tma 这条计算-搬运链被拆成更多级、每级都能独立跑数——级数多、缓冲大、延迟被掩盖得更彻底。
+//              1) wgmma 指令本身就有 4-stage pipeline。
+//              2）寄存器文件 double-buffer 再叠一层 3-4 depth。
+//              3）TMA 异步 3-level pipeline：Level-1 TMA 把 HBM → L2； Level-2 TMA 把 L2 → shared-memory； Level-3 wgmma 把 shared-memory → register-file
+//                 三层 完全独立，每一层都有自己的 FIFO 和 credit 计数器；总深度 ≈ 6-8 拍，只要 K-dimension 够长就能一直背压不住。
+//              4）Shared-memory → Register 再拆 2-stage load。 wgmma 要求 bank-conflict-free 的 matrix descriptor；
+//                 硬件在 真正发射矩阵乘前，还要 先做一次 2-bank 预取 → 再增 2 拍
+//              总深度 12-15 拍 才能真正“退休”一条 wgmma 结果；而 Ada 的 mma.m16n8k8 只有 3-4 拍 就写回。
+//      3）在大m下，gemm处理计算受限区域，反量化属于计算部分。随反量化占比大，性能却不会下降，返而能与bf16持平？
+//       -- 1. 大m时，ampere_q4在L40下并不会比 普通 ampere_bf16性能差多少；
+//                    hopper_q4在H20下并不会比 普通 hopper_bf16性能差多少；
+//                   只是ampere kernel在hopper架构下未使用tma/wgmma/warp specialize，导致无法充分发挥性能，因此有性能锐减的现象。
+//       -- 2. 反量化用的是cuda core，完全放在 Global→Shared→Register 的异步 copy 尾巴上，与 Tensor-Core 的 MMA 指令形成双重流水线。
+//             访存延迟 + 反量化延迟 ≤ Tensor-Core 累加延迟，所以能以tensor core的上限为kernel上限（即对应普通bf16性能）。
+//       -- 3. 当 Tensor-Core 占有率（issued-pipeline-utilization）达到 100% 时，意味着：每个周期、每个 warp 的发射口都成功送出了
+//             一个 Tensor-Core 指令，即没有任何周期是“空转”或“转去发 CUDA-Core/LOAD/SFU” 的。
+//             而cuda core做反量化，虽然与tensor core是相符独立的硬件，但也需要占用发射槽去发射指令，因此会导致tensor core的占用率降低。
+//             又因为本身kernel实现中，tensor core很难真正达到100%占用率，所以天然给cuda core的空隙会更大一些，插入后对原本表现影响不大。
+//             Q：空隙源自哪里：前端每周期只能 pick 1 warp，** pick 不到就空拍**；后端寄存器/共享内存/常量缓存随时可能 stall；
+//                         指令 cache miss、bank conflict、barrier、epilogue 都会把发射口晾出来。
+//                         官方微架构手册把“issue-slot utilization”>90 % 就叫“near peak”，再高就指数级难涨
+//                         ncu调试marlin kernel可能会看到以下数据，即两者相加仍 ≤ 86 %，没有超发，只是把原本会浪费的 14 % 拿了一点出来干反量化。
+//                            issue_slot_utilization        ≈ 86 %  
+//                            tensor_core_utilization       ≈ 84 %  
+//                            alu_utilization  (CUDA-Core)  ≈  2 %  
+//       -- 4. W4A16 在真正进 Tensor Core 之前要先反量化成 BF16 放在寄存器，计算时从寄存器读bf16的权重，从smem读bf16的激活进行计算。
+//             而普通bf16 gemm则AB矩阵都从smem读取，所以w4a16上权重驻留在smem的是4bit数据，节省了3/4的smem，可用于扩大tile或驻留block，从而使pipeline更深更满，以达到比bf16性能更优的目的。
+//             Q：同理，对于ampere也应该是大m下，w4a16比bf16kernel的性能要好。但实际上并没有，w4a16只能拿到90%的bf16性能，为什么？
+//               -- 因为省 smem → 放大 tile这套红利，ampere上吃不到
+//                  1）Ampere 没有 wgmma/TMA，pipeline 本身就浅。最大 MMA 颗粒只有 mma.m16n8k8（= 512 FMA），4 周期就写回；连续发射 4 条即可满占，再扩 K-tile 深度也不会减少 bubble。
+//                     省下的 smem 无法换成更大 tile——库已经把 occupancy 跑满，再放大 tile 反而撑爆寄存器文件（Ampere 每 SM 仅 64 kB）。
+//             Q: hopper 下 w4a16 的压力问题
+//               -- wgmma 有独立寄存器簇，不与普通 CUDA Core 争 RF 配额。汇编里可见 .reg.wgmma 段，容量额外计算，不会挤占用户可见的 256 kB。
+//
+//       其他：
+//       -- 1. wgmma指令本身可带scale，可搜 “GMMA 64x256x16 F32+=BF16*BF16”。但只支持channel-wise？
+//             而ampere的mma指令, 没端口又没广播 bus，反量化只能走 FFMA 串行，使用cuda core；
+//             -- wgmma指令能塞入scale的原因：wgmma 和 mma 的 Pipeline 深度有差别。
+//               wgmma的bf16最大一次可算 M64×N256×K16 (K16是因为16×2B=32B, 正好满足TensorCore最小搬运粒度32B).
+//               1 warp-group 发射，k16 被硬拆成 16 个节拍（每拍 K=1），pipeline 深度就是 16 级，对应 16-cycle 分片的pipeline (只有warp group的mma才有这个说法)。
+//               而sm80 mma是 1 warp 发射，内部 1-cycle 算完毕，虽然存在m16n8k16指令，但 k16 只是 寄存器打包宽度，硬件不再分片。（ampere不分片，只有hopper之后才分）
+//               q: 为什么 16 分片能隐藏反量化
+//               -- 一条 wgmma.mma_async.m64n256k16 需要16个cycle完成，K=16 切成 16 份，每 1 个 cycle 推进一份。
+//                  反量化被塞在哪里第 0 级 由 Tensor Core 内部的 broadcast unit 完成
+//                  int4 × scale → fp16 只占 1 级节拍，第 1~15 级 就是 纯 FMA 累加，不再碰 scale。
+//                  对比 Ampere mma 1 cycle 就 retire，如果也加 1 cycle 反量化 → 总 latency 变成 2 cycle，100% 暴露。Ampere 没有这么多后台节拍，就藏不住。
+//                  multi-stage 只是 把 memory→register 的延迟拆成多拍，ALU 指令依旧要排队，反量化这条 fma 躲不掉。
 //          2. TMA一次搬 8 KB 权重+256 B scale 直接进 寄存器文件, 相比 BF16 的 shared-memory 双缓冲 省 2 次 2 TB/s 量级来回, DRAM 带宽利用率大幅提高（H20上30%-40%？）
 //             (对于大m的计算密集型不适用，但也可延长收益范围) 
 //          3. TMA寄存器直连：权重+scale 一次 8 KB 直接进寄存器文件，bypass shared memory，比 BF16 少 2 次 2 TB/s 寄存器 <=> shared 来回，省 6-8 % 周期。（即rs模式）
 //
-//       -- 补充上面第1点：wgmma 和 mma 的 Pipeline 深度有差别。
-//         wgmma的bf16最大一次可算 M64×N256×K16 (K16是因为16×2B=32B, 正好满足TensorCore最小搬运粒度32B).
-//         1 warp-group 发射，k16 被硬拆成 16 个节拍（每拍 K=1），pipeline 深度就是 16 级，对应 16-cycle 分片的pipeline (只有warp group的mma才有这个说法)。
-//         而sm80 mma是 1 warp 发射，内部 1-cycle 算完毕，虽然存在m16n8k16指令，但 k16 只是 寄存器打包宽度，硬件不再分片。（amphere不分片，只有hopper之后才分）
-//         i: 为什么 16 分片能隐藏反量化
-//         -- 一条 wgmma.mma_async.m64n256k16 需要16个cycle完成，K=16 切成 16 份，每 1 个 cycle 推进一份。
-//            反量化被塞在哪里第 0 级 由 Tensor Core 内部的 broadcast unit 完成
-//            int4 × scale → fp16 只占 1 级节拍，第 1~15 级 就是 纯 FMA 累加，不再碰 scale。
-//            对比 Ampere mma 1 cycle 就 retire，如果也加 1 cycle 反量化 → 总 latency 变成 2 cycle，100% 暴露。Ampere 没有这么多后台节拍，就藏不住。
-//            multi-stage 只是 把 memory→register 的延迟拆成多拍，ALU 指令依旧要排队，反量化这条 fma 躲不掉。
 
 
 // Given a type of MMA instruction, compute a memory reordering atom that places all values

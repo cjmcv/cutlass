@@ -63,11 +63,13 @@
 //               只要 1× 寄存器堆，把省下的寄存器拿来再塞 1-2 组 warp，原理上cooperative性能远优于pingpong。(不再需要MathWarpGroupOrderBarrier)
 //
 // 问题：pingpong很多时候难以发挥cooperative的真实性能，大多以pingpong为主，cooperative为辅。而sm100以后则以cooperative为主，pingpong为辅。
-// 答：1）因为sm90一个 warp 每周期只能发 1 条 MMA，若把 K 切片给 4 组 warp 同时算，前端端口立刻挤爆。
-//        而SM100 的 double-issue 前端 + mma.sp 新指令，单周期可发 2 条 MMA，带宽够了，多组 warp 一起算才不会堵队。
-//     2) sm90 之前没有 sub-warpgroup 级 barrier，__mbarrier 最小同步单位是 32 线程 warp，如果 warp 数 > 硬件 barrier 槽位 就会 串行化，反而更慢。
-//        sm100 开始支持 thread-block-cluster + 更轻量 barrier。
-//     3）sm90寄存器太小，多个warp协作容易导致寄存器溢出。
+// 答：1）sm90一个 warp 每周期只能发 1 条 MMA，若把 K 切片给 4 组 warp 同时算，前端端口立刻挤爆。
+//        sm100 的 double-issue 前端 + mma.sp 新指令，单周期可发 2 条 MMA，带宽够了，多组 warp 一起算才不会堵队。
+//     2) sm90 缺少 sub-warpgroup 轻量同步，cooperative 跨组同步开销大。
+//        sm100 引入 cluster-level 细粒度 barrier，同步成本大幅下降。
+//     3）sm90 每 SM 256 kB RegFile，看似比 Ampere 大，但 wgmma 专用 bank 与普通 RF 重叠；cooperative kernel 常需要 4-8 个 warpgroup 同时驻留，
+//             Reg 用量 >192 kB/SM 时就会溢出到 local-memory，带宽瞬间被拉低.
+//        sm100 增大 RF 并拆分 wgmma bank，溢出概率显著降低。
 //
 // <NT>M warpspecialize 介绍
 // 定义：把一整张 GEMM 的流水线拆成几类专职 warp（group），让它们各自只盯一个子阶段、长期不换岗。
@@ -115,6 +117,7 @@
 // 3）无 mbarrier + ordered sequence barrier：M80 只有 CTA 级 __syncthreads() 或 warp-vote 小把戏，想做“warp 级角色同步”得自己拼标志位，开销大且易翻车；
 //              SM90 提供 SM 级 mbarrier 与 ordered sequence barrier，一条指令就完成“搬完→算→写完”跨角色同步，零分支零投票。
 //
+// <NT> H20下，bf16的KN=4096X4096，tuning选择大多是Cooperative，少数是Pingpong (会存在一个shape的tuning前几名都是pingpong的情况)，且未找到明显规律。
 namespace cutlass::gemm::kernel {
 
 ///////////////////////////////////////////////////////////////////////////////

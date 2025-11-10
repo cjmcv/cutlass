@@ -122,15 +122,15 @@ using namespace detail;
 // 补充扩展：
 // <NT>M g2s, s2g, s2r, r2s 的操作汇总
 //     g2s 的操作有:
-//        1) 普通的 cp.async (32B,amphere，仅g2s) 
+//        1) 普通的 cp.async (32B,ampere，仅g2s) 
 //        2) tma的 cp.async.bulk (128B+，hopper，g2s和s2g均支持)
-//        3) 传统的 ldg.128 (gmem->reg) + sts.128 (reg->smem)。 可见cp.async 不经过寄存器，amphere之前的用ldg+sts都需要经过寄存器。
+//        3) 传统的 ldg.128 (gmem->reg) + sts.128 (reg->smem)。 可见cp.async 不经过寄存器，ampere之前的用ldg+sts都需要经过寄存器。
 //     s2g 的操作有:
 //        1) 异步tma的 cp.async.bulk;
 //        2) 同步的 lds (smem->reg) + stg (reg->gmem); lds是从smem加载，stg是保存到gmem，目标都是reg，ldg和sts依然。
 //     s2r 的操作有:
 //        1) 同步的lds; 
-//        2) 同步的ldmatrix (即是ldsm，仅服务于mma/wmma，amphere支持); 
+//        2) 同步的ldmatrix (即是ldsm，仅服务于mma/wmma，ampere支持); 
 //                     hopper之后的wgmma会直接以smem为数据源，不需要配套s2r的加载指令,由tma从gmem读取到smem过程中就自动完成swizzle，wgmma可以直接使用。
 //                     对于w4a16的kernel，tma可以把w4的数据当8位或16位数据来搬运，本身不支持4bit，所以搬运后需要手动解包int4->fp16,并手动按wgmma要求的swizzle模式写入smem
 //     r2s 的操作有:

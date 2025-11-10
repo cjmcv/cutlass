@@ -40,7 +40,7 @@
 namespace cute
 {
 
-// <NT> tma tesor的异步拷贝指令，同amphere的cp.async(后缀标记为.bulk.tensor.)，不经过寄存器从gmem到smem，支持1D到5D的整个tile的数据拷贝。
+// <NT> tma tesor的异步拷贝指令，同ampere的cp.async(后缀标记为.bulk.tensor.)，不经过寄存器从gmem到smem，支持1D到5D的整个tile的数据拷贝。
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 /// TMA_LOAD : Initiates a TMA copy from global memory to shared memory
 ////////////////////////////////////////////////////////////////////////////////////////////////////

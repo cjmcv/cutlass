@@ -276,7 +276,7 @@ struct SparseMma;
 // mma.sync.aligned.m8n8k32.row.col.satfinite.s32.s4.u4.s32
 // mma.sync.aligned.m8n8k32.row.col.satfinite.s32.u4.u4.s32
 //
-// // sm80 amphere, 一个warp处理的数据量进一步增多
+// // sm80 ampere, 一个warp处理的数据量进一步增多
 // mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32
 // mma.sync.aligned.m16n8k4.row.col.f32.tf32.tf32.f32
 // mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
